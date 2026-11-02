@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-eval-gate"
+version = "0.1.0"
+description = "Score an AI agent on accuracy, cost and latency from recorded runs, prove each test case can fail, and fail the build when a prompt or model change makes it worse."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "agent-eval-gate contributors" }]
+keywords = ["llm", "evals", "ai-agents", "regression-testing", "ci", "cost", "latency"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Testing",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+agent-eval-gate = "agent_eval_gate.cli:main"
+
+[project.urls]
+Source = "https://github.com/RobBrautigam/agent-eval-gate"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --color=no"

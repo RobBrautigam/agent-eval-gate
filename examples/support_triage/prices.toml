@@ -1,0 +1,11 @@
+# Dollars per million tokens, per model. These two models and their prices are INVENTED for the
+# example. Put your provider's published prices here, with the date you read them; a model that
+# appears in a recording and not here is reported as unknown cost, never as free.
+
+[models."example-small"]
+input_per_million = 0.40
+output_per_million = 1.60
+
+[models."example-large"]
+input_per_million = 3.00
+output_per_million = 15.00
