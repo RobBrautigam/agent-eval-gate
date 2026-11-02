@@ -10,6 +10,7 @@ import hashlib
 import importlib
 import importlib.util
 import json
+import os
 import math
 import re
 import sys
@@ -45,7 +46,7 @@ class Case:
 def load_cases(path: str | Path) -> list[Case]:
     path = Path(path)
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
     except OSError as exc:
         raise EvalError(f"cannot read the case file {path}: {exc}") from None
     cases: list[Case] = []
@@ -98,22 +99,46 @@ def _field(output: Any, path: str | None) -> Any:
     return value
 
 
+def _leaves(value: Any) -> list[str]:
+    """Every piece of text in a value: strings, keys, and numbers written out."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [text for key, item in value.items() for text in (str(key), *_leaves(item))]
+    if isinstance(value, (list, tuple)):
+        return [text for item in value for text in _leaves(item)]
+    return [] if value is None else [json.dumps(value)]
+
+
 def _text(value: Any) -> str:
-    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    """The text a check searches: the string itself, or every string in a JSON value, one per
+    line (never the JSON encoding, where a quote reads as backslash-quote)."""
+    return value if isinstance(value, str) else "\n".join(_leaves(value))
 
 
 def _fold(text: str, check: dict) -> str:
     return text.lower() if check.get("ignore_case", True) else text
 
 
+def _same(a: Any, b: Any) -> bool:
+    """Equal and of the same JSON type: false is not 0, true is not 1, 1 is not 1.0 for a bool."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return type(a) is type(b) and a == b
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(_same(a[k], b[k]) for k in a)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(_same(x, y) for x, y in zip(a, b))
+    return a == b
+
+
 def _equals(value: Any, check: dict) -> str | None:
     want = check.get("value")
-    return None if value == want else f"expected {want!r}, got {value!r}"
+    return None if _same(value, want) else f"expected {want!r}, got {value!r}"
 
 
 def _one_of(value: Any, check: dict) -> str | None:
     allowed = check.get("value") or []
-    return None if value in allowed else f"expected one of {allowed!r}, got {value!r}"
+    return None if any(_same(value, a) for a in allowed) else f"expected one of {allowed!r}, got {value!r}"
 
 
 def _contains(value: Any, check: dict) -> str | None:
@@ -158,9 +183,15 @@ def _validate(cid: str, check: Any) -> None:
     if not isinstance(check, dict) or check.get("type") not in CHECKS:
         kind = check.get("type") if isinstance(check, dict) else check
         raise EvalError(f"case {cid!r}: unknown check type {kind!r} (known: {', '.join(sorted(CHECKS))})")
+    if "value" not in check:
+        raise EvalError(f"case {cid!r}: the {check['type']} check has no value")
+    if "path" in check and (not isinstance(check["path"], str) or not check["path"]):
+        raise EvalError(f"case {cid!r}: a check's path must be text such as \"category\" or \"actions.0.name\"")
     if check["type"] == "regex":
+        if not isinstance(check["value"], str):
+            raise EvalError(f"case {cid!r}: a regex check needs text as its value")
         try:
-            re.compile(str(check.get("value", "")))
+            re.compile(check["value"])
         except re.error as exc:
             raise EvalError(f"case {cid!r}: the regex {check.get('value')!r} does not compile: {exc}") from None
     if check["type"] == "max_length" and not isinstance(check.get("value"), int):
@@ -194,8 +225,8 @@ class Reply:
     An agent may also return a bare string or a dict with the same keys."""
     output: Any
     model: str | None = None
-    input_tokens: int = 0
-    output_tokens: int = 0
+    input_tokens: int | None = None   # None: not reported, so the cost is unknown, never $0
+    output_tokens: int | None = None
     latency_ms: float | None = None   # the agent's own measure; otherwise the wall clock is used
 
 
@@ -204,19 +235,26 @@ def load_agent(spec: str) -> Callable[[Any], Any]:
     target, _, name = spec.rpartition(":")
     if not target or not name:
         raise EvalError(f"agent {spec!r} must look like module:function or file.py:function")
-    if target.endswith(".py"):
-        path = Path(target).resolve()
-        if not path.exists():
-            raise EvalError(f"no agent file at {path}")
-        if str(path.parent) not in sys.path:
-            sys.path.insert(0, str(path.parent))  # so the agent file can import its neighbors
-        module_name = f"_agent_eval_gate_{path.stem}_{abs(hash(str(path)))}"
-        loader_spec = importlib.util.spec_from_file_location(module_name, path)
-        module = importlib.util.module_from_spec(loader_spec)
-        sys.modules[module_name] = module
-        loader_spec.loader.exec_module(module)
-    else:
-        module = importlib.import_module(target)
+    try:
+        if target.endswith(".py"):
+            path = Path(target).resolve()
+            if not path.exists():
+                raise EvalError(f"no agent file at {path}")
+            if str(path.parent) not in sys.path:
+                sys.path.insert(0, str(path.parent))  # so the agent file can import its neighbors
+            module_name = f"_agent_eval_gate_{path.stem}_{abs(hash(str(path)))}"
+            loader_spec = importlib.util.spec_from_file_location(module_name, path)
+            module = importlib.util.module_from_spec(loader_spec)
+            sys.modules[module_name] = module
+            loader_spec.loader.exec_module(module)
+        else:
+            if os.getcwd() not in sys.path:
+                sys.path.insert(0, os.getcwd())  # the console script does not put the current folder there
+            module = importlib.import_module(target)
+    except EvalError:
+        raise
+    except (ImportError, SyntaxError) as exc:
+        raise EvalError(f"cannot load the agent {target}: {type(exc).__name__}: {exc}") from None
     fn = getattr(module, name, None)
     if not callable(fn):
         raise EvalError(f"{target} has no function {name!r}")
@@ -227,51 +265,65 @@ def _as_reply(answer: Any) -> Reply:
     if isinstance(answer, Reply):
         return answer
     if isinstance(answer, dict) and "output" in answer:
-        return Reply(answer["output"], answer.get("model"), int(answer.get("input_tokens") or 0),
-                     int(answer.get("output_tokens") or 0), answer.get("latency_ms"))
+        return Reply(answer["output"], answer.get("model"), _count(answer.get("input_tokens")),
+                     _count(answer.get("output_tokens")), answer.get("latency_ms"))
     return Reply(answer)
 
 
-def record(cases: list[Case], agent: Callable[[Any], Any], agent_name: str) -> dict:
-    """Call the agent once per case and keep everything scoring needs."""
-    entries: dict[str, dict] = {}
+def _count(value: Any) -> int | None:
+    return None if value is None else int(value)
+
+
+def record(cases: list[Case], agent: Callable[[Any], Any], agent_name: str,
+           on_case: Callable[[dict], None] | None = None) -> dict:
+    """Call the agent once per case and keep everything scoring needs. `on_case` sees the
+    recording after each case (the CLI saves it there, so an interrupted run keeps what it paid for)."""
+    recording = {
+        "format": FORMAT_VERSION,
+        "agent": agent_name,
+        "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "cases": {},
+    }
     for case in cases:
         started = time.perf_counter()
         try:
             reply = _as_reply(agent(case.input))
-            error = None
-        except Exception as exc:  # an agent that raises is a failing case, not a crashed run
-            reply, error = Reply(None), f"{type(exc).__name__}: {exc}"
-        wall_ms = (time.perf_counter() - started) * 1000
-        entries[case.id] = {
-            "input_hash": case.input_hash,
-            "output": reply.output,
-            "model": reply.model,
-            "input_tokens": reply.input_tokens,
-            "output_tokens": reply.output_tokens,
-            "latency_ms": round(float(reply.latency_ms if reply.latency_ms is not None else wall_ms), 3),
-            "latency_source": "agent" if reply.latency_ms is not None else "wall clock",
-            "error": error,
-        }
-    return {
-        "format": FORMAT_VERSION,
-        "agent": agent_name,
-        "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "cases": entries,
-    }
+            wall_ms = (time.perf_counter() - started) * 1000
+            entry = {
+                "input_hash": case.input_hash,
+                # default=str: an answer that is not JSON (an SDK object) is kept as its text
+                "output": json.loads(json.dumps(reply.output, ensure_ascii=False, default=str)),
+                "model": None if reply.model is None else str(reply.model),
+                "input_tokens": _count(reply.input_tokens),
+                "output_tokens": _count(reply.output_tokens),
+                "latency_ms": round(float(reply.latency_ms if reply.latency_ms is not None else wall_ms), 3),
+                "latency_source": "agent" if reply.latency_ms is not None else "wall clock",
+                "error": None,
+            }
+        except Exception as exc:  # an agent that raises, or answers in a shape that cannot be kept,
+            wall_ms = (time.perf_counter() - started) * 1000  # is a failing case, not a crashed run
+            entry = {"input_hash": case.input_hash, "output": None, "model": None, "input_tokens": None,
+                     "output_tokens": None, "latency_ms": round(wall_ms, 3), "latency_source": "wall clock",
+                     "error": f"{type(exc).__name__}: {exc}"}
+        recording["cases"][case.id] = entry
+        if on_case:
+            on_case(recording)
+    return recording
 
 
 def save_recording(recording: dict, path: str | Path) -> None:
+    """Write through a temporary file, so a run cut off mid-write never leaves half a recording."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # default=str: an answer that is not JSON (an SDK object) is kept as its text, never lost
-    path.write_text(json.dumps(recording, indent=2, ensure_ascii=False, default=str) + "\n", encoding="utf-8")
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(recording, indent=2, ensure_ascii=False, default=str) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
 
 
 def load_recording(path: str | Path) -> dict:
     path = Path(path)
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as exc:
         raise EvalError(f"cannot read the recording {path}: {exc}") from None
     if data.get("format") != FORMAT_VERSION or not isinstance(data.get("cases"), dict):
@@ -286,7 +338,7 @@ def load_prices(path: str | Path | None) -> dict[str, tuple[float, float]]:
     if path is None:
         return {}
     try:
-        data = tomllib.loads(Path(path).read_text(encoding="utf-8"))
+        data = tomllib.loads(Path(path).read_text(encoding="utf-8-sig"))
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise EvalError(f"cannot read the price table {path}: {exc}") from None
     prices: dict[str, tuple[float, float]] = {}
@@ -313,7 +365,7 @@ class CaseScore:
     passed: bool
     reasons: list[str]
     cost_usd: float | None
-    latency_ms: float
+    latency_ms: float | None   # None: no current measure (missing, or recorded for an old input)
     output: Any = None
 
 
@@ -341,7 +393,7 @@ class Score:
         return None if total is None or not self.cases else total / len(self.cases)
 
     def latency(self, pct: float) -> float:
-        return percentile([c.latency_ms for c in self.cases], pct)
+        return percentile([c.latency_ms for c in self.cases if c.latency_ms is not None], pct)
 
     def summary(self) -> dict:
         return {
@@ -363,11 +415,11 @@ def score(cases: list[Case], recording: dict, prices: dict[str, tuple[float, flo
     for case in cases:
         entry = entries.get(case.id)
         if entry is None:
-            result.cases.append(CaseScore(case.id, False, ["not in the recording: record again"], None, 0.0))
+            result.cases.append(CaseScore(case.id, False, ["not in the recording: record again"], None, None))
             continue
         if entry.get("input_hash") != case.input_hash:
             result.cases.append(CaseScore(case.id, False, ["the case's input changed since it was recorded: "
-                                                           "record again"], None, entry.get("latency_ms", 0.0)))
+                                                           "record again"], None, None))
             continue
         reasons = [f"the agent raised {entry['error']}"] if entry.get("error") else run_checks(case, entry.get("output"))
         cost = _cost(entry, prices)
@@ -376,18 +428,30 @@ def score(cases: list[Case], recording: dict, prices: dict[str, tuple[float, flo
     return result
 
 
+def _reported(entry: dict) -> bool:
+    return entry.get("input_tokens") is not None or entry.get("output_tokens") is not None
+
+
 def _cost(entry: dict, prices: dict[str, tuple[float, float]]) -> float | None:
-    tokens = int(entry.get("input_tokens") or 0) + int(entry.get("output_tokens") or 0)
-    if tokens == 0:
-        return 0.0
+    if entry.get("error"):
+        return 0.0  # the call raised: there is no answer to price
+    if not _reported(entry):
+        return None  # no token counts: unknown, never free
+    tokens_in, tokens_out = int(entry.get("input_tokens") or 0), int(entry.get("output_tokens") or 0)
+    if tokens_in + tokens_out == 0:
+        return 0.0  # the agent said zero, in so many words
     model = entry.get("model")
     if model not in prices:
         return None  # unpriced: reported as unknown, never as free
     per_in, per_out = prices[model]
-    return (int(entry["input_tokens"] or 0) * per_in + int(entry["output_tokens"] or 0) * per_out) / 1_000_000
+    return (tokens_in * per_in + tokens_out * per_out) / 1_000_000
 
 
 def unpriced_models(recording: dict, prices: dict[str, tuple[float, float]]) -> list[str]:
-    models = {e.get("model") for e in recording["cases"].values()
-              if int(e.get("input_tokens") or 0) + int(e.get("output_tokens") or 0) > 0}
-    return sorted(str(m) for m in models if m not in prices)
+    """What makes a cost unknown: models with no price row, and answers with no token counts."""
+    entries = [e for e in recording["cases"].values() if not e.get("error")]
+    models = {e.get("model") for e in entries
+              if _reported(e) and int(e.get("input_tokens") or 0) + int(e.get("output_tokens") or 0) > 0}
+    found = sorted(str(m) for m in models if m not in prices)
+    silent = sum(1 for e in entries if not _reported(e))
+    return found + ([f"{silent} answer(s) with no token counts"] if silent else [])

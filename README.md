@@ -9,12 +9,14 @@ from the recording as often as you like, for free.
   agent, so tightening a check or adding a report costs nothing and runs offline.
 - **A gate, not a dashboard you have to remember to open.** `gate` compares a candidate recording
   against a baseline and exits 1 when accuracy drops, cost per case rises or p95 latency rises past
-  your limits, and names every case that newly fails, with the reason.
+  your limits, or a case that passed now fails (even when another case's fix keeps the accuracy
+  level), and names every case that newly fails, with the reason.
 - **Proof that each case can fail.** A check never seen failing proves nothing. `prove` scores every
   case against empty answers and against every other case's answer, and lists the cases that pass
   anyway.
-- **Honest money.** Cost comes from a price table you keep. A model with no price is reported as
-  unknown cost, never as free, and the gate refuses to call an unknown cost a pass.
+- **Honest money.** Cost comes from a price table you keep. A model with no price, or an answer with
+  no token counts, is reported as unknown cost, never as free, and the gate refuses to call an
+  unknown cost a pass.
 - **Stale answers are refused.** Each answer is stored with a hash of its case's input. Change the
   input and the old answer is never scored against it: the case reads "record again".
 - **No dependencies**, Python 3.11 or newer, one self-contained HTML report, no account.
@@ -24,6 +26,7 @@ gate: FAILED (support agent v2 against support agent v1)
   FAIL accuracy   90.9% -> 81.8% (-9.1 points; allowed 0)
   FAIL cost/case  $0.000144 -> $0.001107 (+670%; allowed +10%)
   FAIL p95        616 ms -> 994 ms (+61%; allowed +20%)
+  FAIL newly failing 2 (allowed 0)
 newly failing (2):
   - crash-or-we-cancel: equals escalate: expected True, got False
   - third-time-invoice: equals escalate: expected True, got False
@@ -35,7 +38,7 @@ the reader's light or dark setting:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/report-dark.png">
-  <img alt="The HTML report for the example: the gate's three failed limits, the two newly failing cases, and every case with its answer, cost and latency" src="docs/report-light.png" width="720">
+  <img alt="The HTML report for the example: the gate's four failed limits, the two newly failing cases, and every case with its answer, cost and latency" src="docs/report-light.png" width="720">
 </picture>
 
 ## Quick start (offline, about a minute)
@@ -57,7 +60,8 @@ pytest
 ```
 
 (On Windows PowerShell, write `$X = "examples/support_triage"` first.) `gate` and `prove` exit 1
-on this example on purpose: that is what they are for.
+on this example on purpose: that is what they are for. Every command exits 2, with a one-line
+reason, when it cannot run at all (a missing file, an agent that will not load).
 
 **The example** is a support agent that sorts a ticket (billing, bug, account, how-to), decides
 whether a person should take it, and drafts a reply, over 11 tickets. Version 2 is the change a team
@@ -65,9 +69,9 @@ ships on a Friday: a friendlier prompt on a bigger model, with two words lost fr
 list while rewriting it. Both versions are deterministic keyword rules, not a language model, so the
 quick start runs offline at no cost; their token counts and latencies are **simulated** from the text
 length, in the shape a real model call reports them, and the two models and their prices in
-[`prices.toml`](examples/support_triage/prices.toml) are invented. The gate finds all three
-regressions and names the two tickets that broke; `prove` finds three weak cases, including one whose
-only check is "does not say 'as an AI'", which any answer passes.
+[`prices.toml`](examples/support_triage/prices.toml) are invented. The gate fails on accuracy, cost
+and latency and names the two tickets that broke; `prove` finds three weak cases, including one whose
+only check is "the reply does not say 'as an AI'", which an empty reply passes.
 
 `score` prints:
 
@@ -88,7 +92,7 @@ and `prove` prints:
 3 of 11 case(s) passed on an answer that was not theirs:
   - is-there-a-way does not pin its answer down: it passes on the answer recorded for 'how-to-export'
   - api-500 does not pin its answer down: it passes on the answer recorded for 'crash-or-we-cancel'
-  - no-robot-talk does not pin its answer down: it passes on the answer recorded for 'double-charge', ...
+  - no-robot-talk cannot fail: it passes on an answer whose reply is empty text, an answer whose reply is null, 2 more
 Add a check that only the case's own right answer meets, then run prove again.
 ```
 
@@ -110,8 +114,10 @@ def run(ticket: dict) -> dict:
 ```
 
 Point `--agent` at it as `path/to/file.py:run` (the file's folder is put on the import path, so it
-can import its neighbors) or `package.module:run`. An agent that raises is a failing case with the
-error as its reason, not a crashed run. `agent_eval_gate.Reply` is the same shape as a dataclass.
+can import its neighbors) or `package.module:run` (found from the current folder or the installed
+packages). An agent that raises, or returns a token count or latency that is not a number, is a
+failing case with the error as its reason, not a crashed run. Leave out the token counts and the
+case's cost is unknown, never $0. `agent_eval_gate.Reply` is the same shape as a dataclass.
 This repository never calls a model itself: what your function calls, and what that costs, is yours.
 
 ## Case files
@@ -127,7 +133,7 @@ A case passes when every check passes. Lines starting with `//` are skipped.
 
 | Check | Passes when |
 |---|---|
-| `equals` | the value equals `value` exactly |
+| `equals` | the value equals `value` exactly, type included (`true` is not `1`) |
 | `one_of` | the value is one of the list in `value` |
 | `contains` | the text holds `value` (a string or a list, all required) |
 | `not_contains` | the text holds none of `value` |
@@ -135,8 +141,10 @@ A case passes when every check passes. Lines starting with `//` are skipped.
 | `max_length` | the text is at most `value` characters |
 
 `path` is a dotted path into a JSON answer (`category`, `actions.0.name`); without it the check reads
-the whole answer. Text checks ignore case unless `"ignore_case": false`. A case with no checks is
-refused when the file loads, because it cannot fail.
+the whole answer. Text checks read a string as it is; on a JSON value they read each string, key and
+number in it, never its JSON encoding (so a quote in the reply is a quote, not a backslash and a
+quote). Text checks ignore case unless `"ignore_case": false`. A case with no checks, or a check with
+no `value`, is refused when the file loads, because it cannot work.
 
 There is deliberately no "ask another model to judge" check: every check here is deterministic,
 free and gives the same verdict every time, which is what a gate needs. If you need a judged score,
@@ -162,6 +170,7 @@ on purpose, in the same pull request, and commit the candidate as the new baseli
 | `--max-accuracy-drop` | 0 | percentage points the pass rate may fall |
 | `--max-cost-increase` | 10 | percent the cost per case may rise |
 | `--max-p95-increase` | 20 | percent the 95th-percentile latency may rise |
+| `--max-newly-failing` | 0 | cases that passed in the baseline and may fail in the candidate |
 
 Latency is nearest-rank: on a small suite, p95 is close to the slowest case, so set its limit with
 your suite's size in mind. Latency is whatever was measured when the recording was made.
@@ -170,8 +179,9 @@ your suite's size in mind. Latency is whatever was measured when the recording w
 
 Each case is scored against decoys:
 
-1. **Empty answers** (an empty string, nothing, an empty object). A case that passes one **cannot
-   fail**.
+1. **Empty answers**: an empty string, nothing, an empty object, and answers that hold every field
+   the case's checks read with nothing in it (empty text, null, an empty object, an empty list). A
+   case that passes one **cannot fail**.
 2. **Every other case's recorded answer that differs from its own.** A case that passes one **does
    not pin its answer down**: a wrong answer for this input would pass it too. Identical answers are
    skipped, since two tickets can share one right answer.
@@ -187,6 +197,8 @@ Exit 0 when every case fails every decoy, 1 otherwise.
 | [deepeval](https://github.com/confident-ai/deepeval) | 19,236 | Many model-judged metrics; this keeps every check deterministic and free |
 | [openai/evals](https://github.com/openai/evals) | 19,687 | A framework and a registry of benchmarks; this gates your own agent against its own last good run |
 | [inspect_ai](https://github.com/UKGovernmentBEIS/inspect_ai) | 3,151 | A rich evaluation framework for models; this is a build check for an application |
+| [cryer/agent-eval](https://github.com/cryer/agent-eval) | 28 | The closest in purpose: a CI gate that replays the suite and lets statistics and model judges decide; this scores a recording with deterministic checks, so a re-score is free and identical |
+| [tap222/assay-evals](https://github.com/tap222/assay-evals) | 23 | A pytest plugin with a behavior diff and a CI gate; this one centers on per-case cost from your price table and the `prove` vacuity check |
 
 ## License
 

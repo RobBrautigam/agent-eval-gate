@@ -56,7 +56,14 @@ def test_a_case_file_that_cannot_work_says_why(tmp_path):
     with pytest.raises(EvalError, match="no checks"):
         load_cases(write_cases(tmp_path, [{"id": "a", "input": 1, "checks": []}]))
     with pytest.raises(EvalError, match="used twice"):
-        load_cases(write_cases(tmp_path, [{"id": "a", "input": 1, "checks": [{"type": "equals"}]}] * 2))
+        load_cases(write_cases(tmp_path, [{"id": "a", "input": 1, "checks": [{"type": "equals", "value": 1}]}] * 2))
+    with pytest.raises(EvalError, match="has no value"):
+        load_cases(write_cases(tmp_path, [{"id": "a", "input": 1, "checks": [{"type": "equals"}]}]))
+    with pytest.raises(EvalError, match="path must be text"):
+        load_cases(write_cases(tmp_path, [{"id": "a", "input": 1, "checks": [{"type": "equals", "value": 1,
+                                                                               "path": 3}]}]))
+    with pytest.raises(EvalError, match="needs text"):
+        load_cases(write_cases(tmp_path, [{"id": "a", "input": 1, "checks": [{"type": "regex", "value": 5}]}]))
     with pytest.raises(EvalError, match="unknown check type 'similar'"):
         load_cases(write_cases(tmp_path, [{"id": "a", "input": 1, "checks": [{"type": "similar"}]}]))
     with pytest.raises(EvalError, match="does not compile"):
@@ -150,7 +157,7 @@ def test_the_gate_names_what_broke():
     assert not result.passed
     assert [cid for cid, _ in result.newly_failing] == ["crash-or-we-cancel", "third-time-invoice"]
     assert result.newly_passing == ["is-there-a-way"]
-    assert sum(line.startswith("FAIL") for line in result.lines) == 3
+    assert sum(line.startswith("FAIL") for line in result.lines) == 4  # accuracy, cost, p95, newly failing
 
 
 def test_the_gate_passes_a_run_against_itself():
@@ -160,14 +167,31 @@ def test_the_gate_passes_a_run_against_itself():
 
 def test_loose_limits_let_a_tradeoff_through():
     _cases, _v1, base, cand = example_scores()
-    assert compare(base, cand, Limits(max_accuracy_drop=10, max_cost_increase=1000, max_p95_increase=100)).passed
+    loose = Limits(max_accuracy_drop=10, max_cost_increase=1000, max_p95_increase=100, max_newly_failing=2)
+    assert compare(base, cand, loose).passed
+
+
+def test_a_swap_that_holds_accuracy_still_fails_on_the_case_that_broke():
+    cases = [case([{"type": "equals", "value": "ok"}], "a", "x"), case([{"type": "equals", "value": "ok"}], "b", "y")]
+
+    def agent(right):
+        return lambda v: {"output": "ok" if v == right else "no", "model": "m", "input_tokens": 1,
+                          "output_tokens": 1, "latency_ms": 100}
+
+    before = score(cases, record(cases, agent("x"), "v1"), {"m": (1, 1)})
+    after = score(cases, record(cases, agent("y"), "v2"), {"m": (1, 1)})
+    assert before.accuracy == after.accuracy == 0.5
+    result = compare(before, after, Limits())
+    assert not result.passed and [cid for cid, _ in result.newly_failing] == ["a"]
+    assert result.lines[-1].startswith("FAIL newly failing 1")
 
 
 def test_prove_finds_the_weak_cases_and_spares_the_strong_ones():
     cases, v1, _base, _cand = example_scores()
     found = {v.case_id: v for v in prove(cases, v1)}
     assert set(found) == {"is-there-a-way", "api-500", "no-robot-talk"}
-    assert not any(v.cannot_fail for v in found.values())
+    # an empty reply has no robot talk in it: the case cannot fail until it also asks for a reply
+    assert {cid for cid, v in found.items() if v.cannot_fail} == {"no-robot-talk"}
     weak = case([{"type": "not_contains", "value": "as an AI"}], "weak")
     assert prove([weak], {"cases": {}})[0].cannot_fail
 
@@ -202,6 +226,54 @@ def test_the_command_line_end_to_end(tmp_path):
     assert gated.returncode == 1 and "crash-or-we-cancel" in gated.stdout
     assert (tmp_path / "r.html").read_text(encoding="utf-8").startswith("<!doctype html>")
     assert cli("prove", cases, str(tmp_path / "v1.json"), cwd=tmp_path).returncode == 1
-    assert cli("prove", cases, str(tmp_path / "v1.json"), "--empty-only", cwd=tmp_path).returncode == 0
+    empty_only = cli("prove", cases, str(tmp_path / "v1.json"), "--empty-only", cwd=tmp_path)
+    assert empty_only.returncode == 1 and "no-robot-talk cannot fail" in empty_only.stdout
     broken = cli("score", cases, str(tmp_path / "absent.json"), cwd=tmp_path)
     assert broken.returncode == 2 and "cannot read the recording" in broken.stderr
+    nested = cli("score", cases, str(tmp_path / "v1.json"), "--html", str(tmp_path / "new" / "dir" / "r.html"),
+                 cwd=tmp_path)
+    assert nested.returncode == 0 and (tmp_path / "new" / "dir" / "r.html").exists()
+    missing_module = cli("record", cases, "--agent", "no_such_module:run", "--out", str(tmp_path / "x.json"),
+                         cwd=tmp_path)
+    assert missing_module.returncode == 2 and "cannot load the agent" in missing_module.stderr
+
+
+# ------------------------------------------------------------- shapes the close review found
+
+def test_an_answer_with_no_token_counts_has_an_unknown_cost():
+    c = case([{"type": "equals", "value": "ok"}])
+    rec = record([c], lambda _v: {"output": "ok", "model": "m"}, "a")
+    assert score([c], rec, {"m": (1.0, 1.0)}).cases[0].cost_usd is None
+
+
+def test_equals_is_type_strict():
+    c = case([{"type": "equals", "value": True}])
+    assert run_checks(c, True) == []
+    assert run_checks(c, 1) != []
+    assert run_checks(case([{"type": "equals", "value": 1}]), True) != []
+
+
+def test_text_checks_search_string_values_not_the_json_encoding():
+    c = case([{"type": "contains", "value": "said \"hi\""}])
+    assert run_checks(c, {"reply": "she said \"hi\" twice"}) == []
+    banned = case([{"type": "not_contains", "value": "reply"}])
+    assert run_checks(banned, {"text": "fine"}) == []
+
+
+def test_a_latency_that_is_not_a_number_is_a_failing_case():
+    c = case([{"type": "equals", "value": "ok"}])
+    rec = record([c], lambda _v: {"output": "ok", "latency_ms": "fast"}, "a")
+    assert rec["cases"]["c"]["error"].startswith("ValueError")
+
+
+def test_record_hands_over_the_recording_after_every_case():
+    cases = [case([{"type": "equals", "value": "ok"}], cid) for cid in ("a", "b", "c")]
+    seen: list[int] = []
+    record(cases, lambda _v: "ok", "a", on_case=lambda rec: seen.append(len(rec["cases"])))
+    assert seen == [1, 2, 3]
+
+
+def test_prove_fills_the_fields_a_check_reads():
+    c = case([{"type": "not_contains", "path": "reply", "value": "as an AI"}])
+    found = prove([c], {"cases": {}})
+    assert found and found[0].cannot_fail and any("reply" in label for label in found[0].passes_on)

@@ -68,7 +68,7 @@ def html_page(scores: list[Score], gate: GateResult | None = None, title: str = 
             mark = "pass" if c.passed else "fail"
             why = "" if c.passed else f"<div class=\"why\">{esc('; '.join(c.reasons))}</div>"
             cells.append(f'<td class="{mark}"><span>{mark}</span> {esc(_money(c.cost_usd))}, '
-                         f'{c.latency_ms:.0f} ms<div class="out">{esc(_short(c.output))}</div>{why}</td>')
+                         f'{"-" if c.latency_ms is None else f"{c.latency_ms:.0f}"} ms<div class="out">{esc(_short(c.output))}</div>{why}</td>')
         rows.append(f"<tr><th>{esc(cid)}</th>{''.join(cells)}</tr>")
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">

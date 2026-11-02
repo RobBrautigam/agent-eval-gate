@@ -4,6 +4,9 @@
     agent-eval-gate score  CASES runs/v1.json --prices prices.toml         score a recording (free, no calls)
     agent-eval-gate gate   CASES --baseline runs/v1.json --candidate runs/v2.json --prices prices.toml
     agent-eval-gate prove  CASES runs/v1.json                              find cases that cannot fail
+
+Exit codes: 0 passed, 1 the gate (or prove, or score --strict) found a problem, 2 the run itself could not
+be done (a bad file, an agent that would not load).
 """
 from __future__ import annotations
 
@@ -18,21 +21,26 @@ from .gate import Limits, compare, prove
 from .report import html_page, markdown
 
 
-def _scored(cases_path: str, recording_path: str, prices_path: str | None):
-    cases = load_cases(cases_path)
+def _scored(cases, recording_path: str, prices: dict):
     recording = load_recording(recording_path)
-    prices = load_prices(prices_path)
     missing = unpriced_models(recording, prices)
     if missing:
-        print(f"note: no price row for {', '.join(missing)}; their cost is reported as unknown, never as $0",
-              file=sys.stderr)
-    return cases, recording, score(cases, recording, prices)
+        print(f"note: {recording_path}: no price for {', '.join(missing)}; that cost is reported as unknown, "
+              f"never as $0", file=sys.stderr)
+    return score(cases, recording, prices)
+
+
+def _write(path: str, text: str) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
 
 
 def cmd_record(args: argparse.Namespace) -> int:
     cases = load_cases(args.cases)
     agent = load_agent(args.agent)
-    recording = record(cases, agent, args.name or args.agent)
+    # saved after every case: a run stopped at case 300 keeps the 299 answers it already paid for
+    recording = record(cases, agent, args.name or args.agent, on_case=lambda rec: save_recording(rec, args.out))
     save_recording(recording, args.out)
     errors = sum(1 for e in recording["cases"].values() if e["error"])
     print(f"recorded {len(cases)} case(s) from {recording['agent']} to {args.out}"
@@ -41,19 +49,20 @@ def cmd_record(args: argparse.Namespace) -> int:
 
 
 def cmd_score(args: argparse.Namespace) -> int:
-    _cases, _recording, result = _scored(args.cases, args.recording, args.prices)
+    result = _scored(load_cases(args.cases), args.recording, load_prices(args.prices))
     print(markdown(result))
     if args.json:
-        Path(args.json).write_text(json.dumps(result.summary(), indent=2) + "\n", encoding="utf-8")
+        _write(args.json, json.dumps(result.summary(), indent=2) + "\n")
     if args.html:
-        Path(args.html).write_text(html_page([result], title=f"agent-eval-gate: {result.agent}"), encoding="utf-8")
+        _write(args.html, html_page([result], title=f"agent-eval-gate: {result.agent}"))
     return 0 if result.passed == len(result.cases) or not args.strict else 1
 
 
 def cmd_gate(args: argparse.Namespace) -> int:
-    _c, _r, baseline = _scored(args.cases, args.baseline, args.prices)
-    _c, _r, candidate = _scored(args.cases, args.candidate, args.prices)
-    limits = Limits(args.max_accuracy_drop, args.max_cost_increase, args.max_p95_increase)
+    cases, prices = load_cases(args.cases), load_prices(args.prices)
+    baseline = _scored(cases, args.baseline, prices)
+    candidate = _scored(cases, args.candidate, prices)
+    limits = Limits(args.max_accuracy_drop, args.max_cost_increase, args.max_p95_increase, args.max_newly_failing)
     result = compare(baseline, candidate, limits)
     print(f"gate: {'passed' if result.passed else 'FAILED'} ({candidate.agent} against {baseline.agent})")
     for line in result.lines:
@@ -65,8 +74,7 @@ def cmd_gate(args: argparse.Namespace) -> int:
     if result.newly_passing:
         print(f"newly passing ({len(result.newly_passing)}): {', '.join(result.newly_passing)}")
     if args.html:
-        page = html_page([baseline, candidate], result, title=f"{candidate.agent} against {baseline.agent}")
-        Path(args.html).write_text(page, encoding="utf-8")
+        _write(args.html, html_page([baseline, candidate], result, title=f"{candidate.agent} against {baseline.agent}"))
         print(f"report: {args.html}")
     return 0 if result.passed else 1
 
@@ -118,6 +126,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--max-accuracy-drop", type=float, default=0.0, help="percentage points (default 0)")
     p.add_argument("--max-cost-increase", type=float, default=10.0, help="percent per case (default 10)")
     p.add_argument("--max-p95-increase", type=float, default=20.0, help="percent (default 20)")
+    p.add_argument("--max-newly-failing", type=int, default=0,
+                   help="cases that passed in the baseline and fail in the candidate (default 0)")
     p.add_argument("--html", help="write a one-file HTML report of both runs here")
     p.set_defaults(fn=cmd_gate)
 
@@ -133,6 +143,9 @@ def main(argv: list[str] | None = None) -> int:
         return args.fn(args)
     except EvalError as exc:
         print(f"agent-eval-gate: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 - exit 1 means "the agent got worse"; a crash is never that
+        print(f"agent-eval-gate: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
 
 

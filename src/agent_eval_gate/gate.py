@@ -12,6 +12,7 @@ class Limits:
     max_accuracy_drop: float = 0.0       # percentage points
     max_cost_increase: float = 10.0      # percent, per case
     max_p95_increase: float = 20.0       # percent
+    max_newly_failing: int = 0           # cases that passed in the baseline and fail now
 
 
 @dataclass
@@ -60,6 +61,11 @@ def compare(baseline: Score, candidate: Score, limits: Limits) -> GateResult:
     base = {c.id: c for c in baseline.cases}
     newly_failing = [(c.id, c.reasons) for c in candidate.cases if not c.passed and base.get(c.id) and base[c.id].passed]
     newly_passing = [c.id for c in candidate.cases if c.passed and base.get(c.id) and not base[c.id].passed]
+    # accuracy can hold while one case breaks and another is fixed: a break is still a break
+    broke_ok = len(newly_failing) <= limits.max_newly_failing
+    ok &= broke_ok
+    lines.append(f"{'ok  ' if broke_ok else 'FAIL'} newly failing {len(newly_failing)} "
+                 f"(allowed {limits.max_newly_failing})")
     return GateResult(ok, lines, newly_failing, newly_passing)
 
 
@@ -71,16 +77,50 @@ class Vacuous:
 
 
 EMPTY_DECOYS: list[tuple[str, Any]] = [("an empty answer", ""), ("no answer", None), ("an empty object", {})]
+_EMPTY_VALUES: list[tuple[str, Any]] = [("empty text", ""), ("null", None), ("an empty object", {}),
+                                        ("an empty list", [])]
+
+
+def _with_path(path: str, value: Any) -> Any:
+    """A JSON answer that holds `value` at a dotted path ("reply", "actions.0.name")."""
+    for part in reversed(path.split(".")):
+        value = [value] if part == "0" else {part: value}
+    return value
+
+
+def _merge(a: Any, b: Any) -> Any:
+    if isinstance(a, dict) and isinstance(b, dict):
+        merged = dict(a)
+        for key, item in b.items():
+            merged[key] = _merge(merged[key], item) if key in merged else item
+        return merged
+    return a
+
+
+def empty_decoys(case: Case) -> list[tuple[str, Any]]:
+    """Empty answers, plus answers where every field the case's checks read is there and empty:
+    a check on "reply" never meets an empty reply if the decoys have no "reply" at all."""
+    decoys = list(EMPTY_DECOYS)
+    paths = sorted({c["path"] for c in case.checks if isinstance(c.get("path"), str) and c["path"]})
+    if paths:
+        for label, value in _EMPTY_VALUES:
+            answer: Any = {}
+            for path in paths:
+                answer = _merge(answer, _with_path(path, value))
+            decoys.append((f"an answer whose {', '.join(paths)} {'is' if len(paths) == 1 else 'are'} {label}",
+                           answer))
+    return decoys
 
 
 def prove(cases: list[Case], recording: dict, empty_only: bool = False) -> list[Vacuous]:
     """A check never seen failing proves nothing. Each case is scored against decoys:
-    empty answers (a case that passes one cannot fail at all), then every OTHER case's recorded
-    answer that differs from its own (a case that passes one does not pin its answer down)."""
+    empty answers, including ones that hold every field its checks read with nothing in it (a case
+    that passes one cannot fail at all), then every OTHER case's recorded answer that differs from
+    its own (a case that passes one does not pin its answer down)."""
     outputs = {cid: entry.get("output") for cid, entry in recording["cases"].items() if not entry.get("error")}
     found: list[Vacuous] = []
     for case in cases:
-        empty = [label for label, decoy in EMPTY_DECOYS if not run_checks(case, decoy)]
+        empty = [label for label, decoy in empty_decoys(case) if not run_checks(case, decoy)]
         if empty:
             found.append(Vacuous(case.id, empty, True))
             continue
