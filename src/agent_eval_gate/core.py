@@ -450,7 +450,8 @@ def _cost(entry: dict, prices: dict[str, tuple[float, float]]) -> float | None:
 def unpriced_models(recording: dict, prices: dict[str, tuple[float, float]]) -> list[str]:
     """What makes a cost unknown: models with no price row, and answers with no token counts."""
     entries = [e for e in recording["cases"].values() if not e.get("error")]
-    models = {e.get("model") for e in entries if _reported(e) and _cost(e, prices) is None}
-    found = sorted(str(m) for m in models)
+    models = {e.get("model") for e in entries
+              if _reported(e) and int(e.get("input_tokens") or 0) + int(e.get("output_tokens") or 0) > 0}
+    found = sorted(str(m) for m in models if m not in prices)
     silent = sum(1 for e in entries if not _reported(e))
     return found + ([f"{silent} answer(s) with no token counts"] if silent else [])
