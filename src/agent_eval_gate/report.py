@@ -75,9 +75,9 @@ def html_page(scores: list[Score], gate: GateResult | None = None, title: str = 
 <title>{esc(title)}</title>
 <style>
 :root {{ color-scheme: light dark; --bg:#fbfbfa; --fg:#1d1d1f; --muted:#6b6b70; --line:#e4e4e2; --card:#fff;
-  --ok:#11743b; --okbg:#e8f5ed; --bad:#a3221b; --badbg:#fbeceb; }}
+  --ok:#11743b; --bad:#a3221b; --badbg:#fbeceb; }}
 @media (prefers-color-scheme: dark) {{ :root {{ --bg:#141416; --fg:#ececee; --muted:#9a9aa2; --line:#2c2c31;
-  --card:#1c1c20; --ok:#6fd49a; --okbg:#15291d; --bad:#ff8f87; --badbg:#2d1716; }} }}
+  --card:#1c1c20; --ok:#6fd49a; --bad:#ff8f87; --badbg:#2d1716; }} }}
 body {{ margin:0; padding:32px clamp(16px,4vw,48px); background:var(--bg); color:var(--fg);
   font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }}
 h1 {{ font-size:22px; margin:0 0 20px; }} h2 {{ font-size:16px; margin:0 0 12px; }}
