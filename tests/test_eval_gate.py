@@ -10,10 +10,10 @@ from pathlib import Path
 
 import pytest
 
-from agent_eval_gate.core import (Case, EvalError, Reply, load_agent, load_cases, load_prices, percentile,
-                                  record, run_checks, score)
+from agent_eval_gate.core import (Case, EvalError, Reply, load_agent, load_cases, load_prices, load_recording,
+                                  percentile, record, run_checks, save_recording, score)
 from agent_eval_gate.gate import EMPTY_DECOYS, Limits, compare, empty_decoys, prove
-from agent_eval_gate.report import html_page
+from agent_eval_gate.report import html_page, markdown
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = ROOT / "examples" / "support_triage"
@@ -360,12 +360,102 @@ def test_a_latency_of_another_number_type_or_too_large_for_a_float_meets_the_sam
     assert len(error) < 200  # the value is shown cut short, never as thousands of digits
 
 
-def test_a_case_failed_by_a_refused_number_keeps_no_answer_and_adds_nothing_to_the_cost():
+def test_a_case_failed_by_a_refused_number_keeps_no_answer_and_its_cost_is_unknown():
     c = case([{"type": "equals", "value": "ok"}])
     entry = recorded(answer_with(input_tokens=3, output_tokens=2, latency_ms="500"))
     assert (entry["output"], entry["input_tokens"], entry["output_tokens"]) == (None, None, None)
     scored = score([c], {"cases": {"c": entry}}, {"m": (1_000_000.0, 1_000_000.0)})
-    assert (scored.cases[0].passed, scored.cases[0].cost_usd, scored.cost_total) == (False, 0.0, 0.0)
+    assert (scored.cases[0].passed, scored.cases[0].cost_usd, scored.cost_total) == (False, None, None)
+
+
+# ------------------------------------------------------------- the cost of a case whose numbers were refused
+
+PRICED = {"m": (1.0, 1.0)}
+
+
+def test_a_case_whose_token_count_was_refused_has_an_unknown_cost_in_the_score_and_the_report():
+    c = case([{"type": "equals", "value": "ok"}])
+    result = score([c], record([c], lambda _v: answer_with(input_tokens="300", output_tokens=20), "a"), PRICED)
+    assert (result.cases[0].passed, result.cases[0].cost_usd, result.cost_total, result.cost_per_case) == (
+        False, None, None, None)
+    assert (result.summary()["cost_total_usd"], result.summary()["cost_per_case_usd"]) == (None, None)
+    assert "| unknown | unknown |" in markdown(result)
+    page = html_page([result])
+    assert "<b>unknown</b><span>cost per case" in page and "<span>fail</span> unknown," in page
+
+
+def test_a_candidate_that_starts_returning_bad_token_counts_never_reads_cheaper():
+    cases = [case([{"type": "equals", "value": "ok"}], cid, cid) for cid in ("a", "b")]
+    base = score(cases, record(cases, lambda _v: answer_with(input_tokens=1000, output_tokens=1000, latency_ms=100),
+                               "v1"), PRICED)
+    cand = score(cases, record(cases, lambda v: answer_with(input_tokens="1000" if v == "b" else 1000,
+                                                            output_tokens=1000, latency_ms=100), "v2"), PRICED)
+    result = compare(base, cand, Limits(max_accuracy_drop=100, max_newly_failing=2))  # accuracy loosened on purpose
+    assert not result.passed
+    assert result.lines[1].startswith("FAIL cost/case  unknown")
+
+
+def test_a_case_whose_agent_raised_still_adds_nothing_to_the_cost():
+    def agent(value):
+        if value == "b":
+            raise RuntimeError("model timed out")
+        return answer_with()
+
+    result = score(THREE, record(THREE, agent, "a"), PRICED)
+    assert [c.cost_usd for c in result.cases] == [pytest.approx(2e-6), 0.0, pytest.approx(2e-6)]
+    assert result.cost_total == pytest.approx(4e-6)
+
+
+# ------------------------------------------------------------- a recording's numbers, when it loads
+
+def saved(tmp_path: Path, field: str, value) -> Path:
+    """A recording of one case, "double-charge", with one value set by hand."""
+    c = case([{"type": "equals", "value": "ok"}], "double-charge")
+    rec = record([c], lambda _v: answer_with(latency_ms=10), "a")
+    rec["cases"]["double-charge"][field] = value
+    save_recording(rec, tmp_path / "r.json")
+    return tmp_path / "r.json"
+
+
+@pytest.mark.parametrize("field, value", [
+    ("input_tokens", "300"), ("input_tokens", -5), ("input_tokens", 2.9), ("output_tokens", True),
+    ("latency_ms", "500"), ("latency_ms", -3), ("latency_ms", float("nan")), ("latency_ms", float("inf")),
+], ids=["text-count", "negative-count", "fractional-count", "true-count",
+        "text-latency", "negative-latency", "nan-latency", "infinite-latency"])
+def test_a_recording_with_a_number_that_breaks_the_rules_is_refused_naming_the_case(tmp_path, field, value):
+    with pytest.raises(EvalError, match=f"case 'double-charge': {field} must be"):
+        load_recording(saved(tmp_path, field, value))
+
+
+def test_a_recording_with_whole_counts_finite_latencies_and_errors_still_loads(tmp_path):
+    for field, value in [("input_tokens", 300.0), ("output_tokens", None), ("latency_ms", 0), ("latency_ms", None)]:
+        assert load_recording(saved(tmp_path, field, value))["cases"]["double-charge"][field] == value
+    errors = record(THREE, lambda v: 1 / 0 if v == "b" else answer_with(), "a")
+    save_recording(errors, tmp_path / "e.json")
+    assert load_recording(tmp_path / "e.json")["cases"]["b"]["error"] == "ZeroDivisionError: division by zero"
+
+
+def test_a_recording_whose_case_or_whole_file_is_not_an_object_is_refused(tmp_path):
+    path = saved(tmp_path, "input_tokens", 1)
+    rec = json.loads(path.read_text(encoding="utf-8"))
+    rec["cases"]["double-charge"] = ["ok"]
+    path.write_text(json.dumps(rec), encoding="utf-8")
+    with pytest.raises(EvalError, match="case 'double-charge' is not a JSON object"):
+        load_recording(path)
+    (tmp_path / "list.json").write_text("[1, 2]", encoding="utf-8")
+    with pytest.raises(EvalError, match="not a recording this version can read"):
+        load_recording(tmp_path / "list.json")
+
+
+def test_score_gate_and_prove_exit_2_on_a_recording_with_a_refused_number(tmp_path):
+    path = saved(tmp_path, "input_tokens", -5)
+    cases = write_cases(tmp_path, [{"id": "double-charge", "input": "x", "checks": [{"type": "equals", "value": "ok"}]}])
+    for args in (["score", str(cases), str(path)], ["gate", str(cases), "--baseline", str(path), "--candidate", str(path)],
+                 ["prove", str(cases), str(path)]):
+        result = cli(*args, cwd=tmp_path)
+        assert result.returncode == 2, (args[0], result.stdout, result.stderr)
+        assert result.stderr.strip().splitlines() == [
+            f"agent-eval-gate: {path}: case 'double-charge': input_tokens must be a whole number of zero or more, got -5"]
 
 
 # ------------------------------------------------------------- an agent that exits or is canceled
