@@ -445,6 +445,24 @@ def test_a_refused_number_reads_the_agent_returned_and_a_raise_still_reads_the_a
     ]
 
 
+def test_a_hand_edited_refused_entry_whose_error_is_not_text_still_scores(tmp_path):
+    c = case([{"type": "equals", "value": "ok"}], "double-charge")
+    rec = record([c], lambda _v: answer_with(input_tokens="300"), "a")
+    rec["cases"]["double-charge"].update(error=5, refused=True)
+    save_recording(rec, tmp_path / "r.json")
+    result = score([c], load_recording(tmp_path / "r.json"), PRICED)
+    assert (result.cases[0].reasons, result.cases[0].cost_usd) == (["the agent returned a refused number: 5"], None)
+
+
+def test_a_refused_case_in_a_recording_made_before_refusals_were_marked_still_reads_as_raised_at_0():
+    rec = record(THREE, lambda v: answer_with(input_tokens="300") if v == "b" else answer_with(), "a")
+    rec["cases"]["b"].pop("refused", None)  # what an earlier version wrote: no mark
+    result = score(THREE, rec, PRICED)
+    assert result.cases[1].cost_usd == 0.0
+    assert result.cases[1].reasons == [
+        "the agent raised ValueError: input_tokens must be a whole number of zero or more, got '300'"]
+
+
 # ------------------------------------------------------------- a recording's numbers, when it loads
 
 def saved(tmp_path: Path, field: str, value) -> Path:
@@ -631,25 +649,42 @@ def test_ctrl_c_from_an_agent_keeps_python_s_own_exit_through_the_command_line(t
     assert result.stderr.strip().splitlines()[-1] == "KeyboardInterrupt"
 
 
-class UnprintableError(Exception):
-    def __str__(self):
-        raise RuntimeError("this error cannot be printed")
+def unprintable(raises: type[BaseException]) -> type[Exception]:
+    """An exception whose `__str__` raises `raises`."""
+    class UnprintableError(Exception):
+        def __str__(self):
+            raise raises("this error cannot be printed")
+    return UnprintableError
 
 
-def test_an_exception_that_cannot_be_printed_is_named_by_its_class_and_the_run_goes_on():
+@pytest.mark.parametrize("raises", [RuntimeError, GeneratorExit], ids=["runtime-error", "generator-exit"])
+def test_an_exception_that_cannot_be_printed_is_named_by_its_class_and_the_run_goes_on(raises):
+    error = unprintable(raises)
+
     def agent(value):
         if value == "b":
-            raise UnprintableError()
+            raise error()
         return "ok"
 
     rec = record(THREE, agent, "a")
     assert [rec["cases"][cid]["error"] for cid in ("a", "b", "c")] == [None, "UnprintableError", None]
 
 
-def test_an_agent_that_raises_an_unprintable_exception_as_it_loads_exits_2_with_its_name(tmp_path):
+def test_ctrl_c_while_an_error_is_printed_still_stops_the_run():
+    error = unprintable(KeyboardInterrupt)
+
+    def agent(_value):
+        raise error()
+
+    with pytest.raises(KeyboardInterrupt):
+        record(THREE, agent, "a")
+
+
+@pytest.mark.parametrize("raises", ["RuntimeError", "GeneratorExit"])
+def test_an_agent_that_raises_an_unprintable_exception_as_it_loads_exits_2_with_its_name(tmp_path, raises):
     result = record_three(tmp_path, 'class Unprintable(Exception):\n    def __str__(self):\n'
-                                    '        raise RuntimeError("no")\n\nraise Unprintable()\n')
-    assert result.returncode == 2, result.stderr
+                                    f'        raise {raises}("no")\n\nraise Unprintable()\n')
+    assert result.returncode == 2, result.stderr  # never 1, the code kept for "the gate found a problem"
     assert result.stderr.strip().splitlines() == ["agent-eval-gate: Unprintable"]
 
 
