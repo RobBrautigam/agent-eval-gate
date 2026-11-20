@@ -233,6 +233,10 @@ class Reply:
     latency_ms: float | None = None   # the agent's own measure; otherwise the wall clock is used
 
 
+# what `record` turns into a failing case; anything else that is not an Exception (Ctrl-C, GeneratorExit) stops it
+_FAILS_A_CASE = (Exception, SystemExit, asyncio.CancelledError)
+
+
 def load_agent(spec: str) -> Callable[[Any], Any]:
     """`package.module:function` or `path/to/file.py:function`."""
     target, _, name = spec.rpartition(":")
@@ -325,8 +329,12 @@ def _latency(value: Any) -> float:
 
 
 def _reason(exc: BaseException) -> str:
-    """The exception's name, then its message when it has one (`sys.exit()` reads "SystemExit", not "SystemExit: ")."""
-    message = str(exc)
+    """The exception's name, then its message when it has one (`sys.exit()` reads "SystemExit", not "SystemExit: ").
+    A message that cannot be read (a `__str__` that raises) leaves the name alone, so the run goes on."""
+    try:
+        message = str(exc)
+    except _FAILS_A_CASE:
+        message = ""
     return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
 
 
@@ -362,7 +370,7 @@ def record(cases: list[Case], agent: Callable[[Any], Any], agent_name: str,
             entry["refused"] = True
         # an agent that raises, calls sys.exit, is canceled, or answers in a shape that cannot be kept
         # is a failing case, not a crashed run; Ctrl-C (KeyboardInterrupt) still stops the run
-        except (Exception, SystemExit, asyncio.CancelledError) as exc:
+        except _FAILS_A_CASE as exc:
             entry = _failed(case, started, _reason(exc))
         recording["cases"][case.id] = entry
         if on_case:
@@ -498,7 +506,11 @@ def score(cases: list[Case], recording: dict, prices: dict[str, tuple[float, flo
             result.cases.append(CaseScore(case.id, False, ["the case's input changed since it was recorded: "
                                                            "record again"], None, None))
             continue
-        reasons = [f"the agent raised {entry['error']}"] if entry.get("error") else run_checks(case, entry.get("output"))
+        error = entry.get("error")
+        if error and entry.get("refused"):  # `record` refused a number the agent returned; the agent did not raise
+            reasons = [f"the agent returned a refused number: {error.removeprefix('ValueError: ')}"]
+        else:
+            reasons = [f"the agent raised {error}"] if error else run_checks(case, entry.get("output"))
         cost = _cost(entry, prices)
         result.cases.append(CaseScore(case.id, not reasons, reasons, cost, float(entry.get("latency_ms") or 0.0),
                                       entry.get("output")))
@@ -522,7 +534,11 @@ def _cost(entry: dict, prices: dict[str, tuple[float, float]]) -> float | None:
     if model not in prices:
         return None  # unpriced: reported as unknown, never as free
     per_in, per_out = prices[model]
-    return (tokens_in * per_in + tokens_out * per_out) / 1_000_000
+    try:
+        cost = (tokens_in * per_in + tokens_out * per_out) / 1_000_000
+    except OverflowError:
+        return None  # a count too large for a float: unknown, never a stopped score
+    return cost if math.isfinite(cost) else None  # a cost past what a float holds: unknown, never infinite
 
 
 def unpriced_models(recording: dict, prices: dict[str, tuple[float, float]]) -> list[str]:
