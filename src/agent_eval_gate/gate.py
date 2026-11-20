@@ -89,25 +89,41 @@ def _with_path(path: str, value: Any) -> Any:
 
 
 def _merge(a: Any, b: Any) -> Any:
-    if isinstance(a, dict) and isinstance(b, dict):
-        merged = dict(a)
-        for key, item in b.items():
+    """Two empty answers as one that holds every field of both: objects key by key, lists item by item.
+    An empty value gives way to a field that holds a deeper checked field (`reply` to `reply.text`, the
+    answer `{}` to a list at the top); a list and an object at one place become one object keyed by
+    position ("0", "1"), which a path reads the same way."""
+    if any(a == empty for _label, empty in _EMPTY_VALUES):
+        return b
+    if any(b == empty for _label, empty in _EMPTY_VALUES):
+        return a
+    if isinstance(a, list) and isinstance(b, list):
+        return [_merge(x, y) for x, y in zip(a, b)] + a[len(b):] + b[len(a):]
+    if isinstance(a, (dict, list)) and isinstance(b, (dict, list)):
+        merged = _keyed(a)
+        for key, item in _keyed(b).items():
             merged[key] = _merge(merged[key], item) if key in merged else item
         return merged
     return a
 
 
+def _keyed(value: dict | list) -> dict:
+    return {str(index): item for index, item in enumerate(value)} if isinstance(value, list) else dict(value)
+
+
 def empty_decoys(case: Case) -> list[tuple[str, Any]]:
-    """Empty answers, plus answers where every field the case's checks read is there and empty:
-    a check on "reply" never meets an empty reply if the decoys have no "reply" at all."""
+    """Empty answers, plus answers where every field the case's checks read is there and empty (a field
+    with a checked field beneath it holds that field): a check on "reply" never meets an empty reply if
+    the decoys have no "reply" at all."""
     decoys = list(EMPTY_DECOYS)
     paths = sorted({c["path"] for c in case.checks if isinstance(c.get("path"), str) and c["path"]})
     if paths:
+        empty = [p for p in paths if not any(q.startswith(f"{p}.") for q in paths)]  # the rest hold these
         for label, value in _EMPTY_VALUES:
             answer: Any = {}
             for path in paths:
                 answer = _merge(answer, _with_path(path, value))
-            decoys.append((f"an answer whose {', '.join(paths)} {'is' if len(paths) == 1 else 'are'} {label}",
+            decoys.append((f"an answer whose {', '.join(empty)} {'is' if len(empty) == 1 else 'are'} {label}",
                            answer))
     return decoys
 

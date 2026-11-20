@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 import sys
+from decimal import Decimal
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
 
 from agent_eval_gate.core import (Case, EvalError, Reply, load_agent, load_cases, load_prices, percentile,
                                   record, run_checks, score)
-from agent_eval_gate.gate import Limits, compare, prove
+from agent_eval_gate.gate import EMPTY_DECOYS, Limits, compare, empty_decoys, prove
 from agent_eval_gate.report import html_page
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -277,3 +280,238 @@ def test_prove_fills_the_fields_a_check_reads():
     c = case([{"type": "not_contains", "path": "reply", "value": "as an AI"}])
     found = prove([c], {"cases": {}})
     assert found and found[0].cannot_fail and any("reply" in label for label in found[0].passes_on)
+
+
+# ------------------------------------------------------------- numbers an agent reports
+
+def answer_with(**fields) -> dict:
+    return {"output": "ok", "model": "m", "input_tokens": 1, "output_tokens": 1, **fields}
+
+
+def recorded(answer) -> dict:
+    return record([case([{"type": "equals", "value": "ok"}])], lambda _v: answer, "a")["cases"]["c"]
+
+
+@pytest.mark.parametrize("count", ["300", 2.9, -5, float("nan"), True],
+                         ids=["text", "fractional", "negative", "nan", "true"])
+def test_a_token_count_that_is_not_a_whole_number_of_zero_or_more_is_a_failing_case(count):
+    entry = recorded(answer_with(input_tokens=count))
+    assert (entry["error"] or "").startswith("ValueError: input_tokens must be a whole number of zero or more")
+    assert entry["input_tokens"] is None
+
+
+def test_output_tokens_and_a_reply_object_meet_the_same_rule():
+    assert "output_tokens must be a whole number" in (recorded(answer_with(output_tokens=-1))["error"] or "")
+    assert "input_tokens must be a whole number" in (recorded(Reply("ok", "m", 2.5, 1))["error"] or "")
+
+
+@pytest.mark.parametrize("latency", [-3, float("inf"), float("nan"), "500", True],
+                         ids=["negative", "infinite", "nan", "text", "true"])
+def test_a_latency_that_is_not_a_finite_number_of_zero_or_more_is_a_failing_case(latency):
+    entry = recorded(answer_with(latency_ms=latency))
+    assert (entry["error"] or "").startswith("ValueError: latency_ms must be a finite number of zero or more")
+
+
+def test_whole_token_counts_and_finite_latencies_are_kept():
+    entry = recorded(answer_with(input_tokens=300.0, output_tokens=0, latency_ms=12.5))
+    assert entry["error"] is None
+    assert (entry["input_tokens"], entry["output_tokens"], entry["latency_ms"]) == (300, 0, 12.5)
+    assert type(entry["input_tokens"]) is int
+    assert recorded(answer_with(latency_ms=0))["latency_ms"] == 0
+
+
+@pytest.mark.parametrize("count", [Decimal("300"), Decimal("300.0"), Fraction(300)],
+                         ids=["decimal", "decimal-with-a-point", "fraction"])
+def test_a_whole_count_of_any_number_type_is_kept_as_an_int(count):
+    entry = recorded(answer_with(input_tokens=count, output_tokens=count))
+    assert entry["error"] is None
+    assert (entry["input_tokens"], entry["output_tokens"]) == (300, 300)
+    assert type(entry["input_tokens"]) is int and type(entry["output_tokens"]) is int
+
+
+@pytest.mark.parametrize("latency", [Decimal("500"), Fraction(1, 2)], ids=["decimal", "fraction"])
+def test_a_finite_latency_of_any_number_type_is_kept_as_a_float(latency):
+    entry = recorded(answer_with(latency_ms=latency))
+    assert entry["error"] is None and entry["latency_ms"] == float(latency)
+    assert type(entry["latency_ms"]) is float
+
+
+def test_numpy_numbers_meet_the_same_rule():
+    np = pytest.importorskip("numpy")
+    entry = recorded(answer_with(input_tokens=np.float32(300.0), output_tokens=np.int64(2),
+                                 latency_ms=np.float32(12.5)))
+    assert entry["error"] is None
+    assert (entry["input_tokens"], entry["output_tokens"], entry["latency_ms"]) == (300, 2, 12.5)
+    assert "input_tokens must be a whole number" in (recorded(answer_with(input_tokens=np.float32(2.5)))["error"] or "")
+
+
+@pytest.mark.parametrize("count", [Decimal("2.5"), Decimal("-1"), Decimal("NaN"), Decimal("Infinity"), Fraction(5, 2)],
+                         ids=["decimal-fraction", "decimal-negative", "decimal-nan", "decimal-infinite", "fraction"])
+def test_a_count_of_another_number_type_meets_the_same_rule(count):
+    entry = recorded(answer_with(input_tokens=count))
+    assert (entry["error"] or "").startswith("ValueError: input_tokens must be a whole number of zero or more")
+
+
+@pytest.mark.parametrize("latency", [Decimal("-1"), Decimal("NaN"), Decimal("1e400"), 10 ** 400, 10 ** 5000],
+                         ids=["decimal-negative", "decimal-nan", "decimal-too-large", "too-large", "too-long-to-print"])
+def test_a_latency_of_another_number_type_or_too_large_for_a_float_meets_the_same_rule(latency):
+    error = recorded(answer_with(latency_ms=latency))["error"] or ""
+    assert error.startswith("ValueError: latency_ms must be a finite number of zero or more")
+    assert len(error) < 200  # the value is shown cut short, never as thousands of digits
+
+
+def test_a_case_failed_by_a_refused_number_keeps_no_answer_and_adds_nothing_to_the_cost():
+    c = case([{"type": "equals", "value": "ok"}])
+    entry = recorded(answer_with(input_tokens=3, output_tokens=2, latency_ms="500"))
+    assert (entry["output"], entry["input_tokens"], entry["output_tokens"]) == (None, None, None)
+    scored = score([c], {"cases": {"c": entry}}, {"m": (1_000_000.0, 1_000_000.0)})
+    assert (scored.cases[0].passed, scored.cases[0].cost_usd, scored.cost_total) == (False, 0.0, 0.0)
+
+
+# ------------------------------------------------------------- an agent that exits or is canceled
+
+def agent_file(tmp_path: Path, body: str) -> str:
+    path = tmp_path / "agent_under_test.py"
+    path.write_text(body, encoding="utf-8")
+    return f"{path}:run"
+
+
+EXITS_AS_IT_LOADS = 'import sys\nsys.exit("missing API key")\n\ndef run(v):\n    return v\n'
+THREE = [case([{"type": "equals", "value": "ok"}], cid, cid) for cid in ("a", "b", "c")]
+
+
+def test_an_agent_that_calls_sys_exit_as_it_loads_will_not_load(tmp_path):
+    with pytest.raises(EvalError, match="cannot load the agent .*SystemExit: missing API key"):
+        load_agent(agent_file(tmp_path, EXITS_AS_IT_LOADS))
+
+
+def test_an_agent_canceled_as_it_loads_will_not_load(tmp_path):
+    with pytest.raises(EvalError, match="cannot load the agent .*CancelledError"):
+        load_agent(agent_file(tmp_path, "import asyncio\nraise asyncio.CancelledError()\n\ndef run(v):\n    return v\n"))
+
+
+def test_the_command_line_exits_2_for_an_agent_that_calls_sys_exit_as_it_loads(tmp_path):
+    result = cli("record", str(EXAMPLE / "cases.jsonl"), "--agent", agent_file(tmp_path, EXITS_AS_IT_LOADS),
+                 "--out", str(tmp_path / "r.json"), cwd=tmp_path)
+    assert result.returncode == 2, result.stderr
+    assert "cannot load the agent" in result.stderr and "missing API key" in result.stderr
+
+
+def test_an_agent_that_calls_sys_exit_on_a_case_fails_that_case_and_the_run_goes_on():
+    def agent(value):
+        if value == "b":
+            sys.exit("quota exceeded")
+        return "ok"
+
+    rec = record(THREE, agent, "a")
+    assert [rec["cases"][cid]["error"] for cid in ("a", "b", "c")] == [None, "SystemExit: quota exceeded", None]
+    assert [c.passed for c in score(THREE, rec, {}).cases] == [True, False, True]
+
+
+def test_an_agent_canceled_on_a_case_fails_that_case_and_the_run_goes_on():
+    def agent(value):
+        if value == "b":
+            raise asyncio.CancelledError()
+        return "ok"
+
+    rec = record(THREE, agent, "a")
+    assert (rec["cases"]["b"]["error"] or "").startswith("CancelledError")
+    assert [rec["cases"][cid]["error"] for cid in ("a", "c")] == [None, None]
+
+
+def test_an_exit_or_a_cancel_with_no_message_is_named_with_no_empty_reason(tmp_path):
+    def agent(value):
+        if value == "b":
+            sys.exit()
+        if value == "c":
+            raise asyncio.CancelledError()
+        return "ok"
+
+    rec = record(THREE, agent, "a")
+    assert [rec["cases"][cid]["error"] for cid in ("b", "c")] == ["SystemExit", "CancelledError"]
+    with pytest.raises(EvalError) as raised:
+        load_agent(agent_file(tmp_path, "import sys\nsys.exit()\n\ndef run(v):\n    return v\n"))
+    assert str(raised.value).endswith(": SystemExit")
+
+
+def test_the_command_line_records_past_an_agent_that_calls_sys_exit_on_a_case(tmp_path):
+    cases = write_cases(tmp_path, [{"id": cid, "input": cid, "checks": [{"type": "equals", "value": "ok"}]}
+                                   for cid in ("a", "b", "c")])
+    spec = agent_file(tmp_path, 'import sys\n\ndef run(v):\n    if v == "b":\n        sys.exit("quota exceeded")\n'
+                                '    return "ok"\n')
+    result = cli("record", str(cases), "--agent", spec, "--out", str(tmp_path / "r.json"), cwd=tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "recorded 3 case(s)" in result.stdout and "(1 raised)" in result.stdout
+
+
+def test_ctrl_c_still_stops_the_run(tmp_path):
+    def agent(value):
+        if value == "b":
+            raise KeyboardInterrupt
+        return "ok"
+
+    saved: list[list[str]] = []
+    with pytest.raises(KeyboardInterrupt):
+        record(THREE, agent, "a", on_case=lambda rec: saved.append(list(rec["cases"])))
+    assert saved == [["a"]]  # the cases answered before it are kept
+    with pytest.raises(KeyboardInterrupt):
+        load_agent(agent_file(tmp_path, "raise KeyboardInterrupt\n\ndef run(v):\n    return v\n"))
+
+
+def test_any_other_exception_that_is_not_an_exception_still_stops_the_run(tmp_path):
+    def agent(value):
+        if value == "b":
+            raise GeneratorExit
+        return "ok"
+
+    with pytest.raises(GeneratorExit):
+        record(THREE, agent, "a")
+    with pytest.raises(GeneratorExit):
+        load_agent(agent_file(tmp_path, "raise GeneratorExit\n\ndef run(v):\n    return v\n"))
+
+
+# ------------------------------------------------------------- the empty answers prove builds
+
+def filled(c: Case) -> list:
+    """The empty answers that hold the fields the case's checks read, one per empty value."""
+    return [decoy for _label, decoy in empty_decoys(c)[len(EMPTY_DECOYS):]]
+
+
+def not_contains(*paths: str) -> Case:
+    return case([{"type": "not_contains", "path": path, "value": "x"} for path in paths])
+
+
+def test_prove_fills_two_fields_under_one_list_item():
+    c = not_contains("actions.0.id", "actions.0.name")
+    assert filled(c)[0] == {"actions": [{"id": "", "name": ""}]}
+    assert prove([c], {"cases": {}}, empty_only=True)[0].cannot_fail
+
+
+def test_prove_fills_a_path_into_a_list_at_the_top_of_the_answer():
+    c = not_contains("0.name")
+    assert filled(c) == [[{"name": ""}], [{"name": None}], [{"name": {}}], [{"name": []}]]
+    assert prove([c], {"cases": {}}, empty_only=True)[0].cannot_fail
+
+
+def test_prove_fills_two_items_of_one_list():
+    c = not_contains("actions.0.id", "actions.1.id")
+    assert all(run_checks(case([{"type": "equals", "path": p, "value": ""}]), filled(c)[0]) == []
+               for p in ("actions.0.id", "actions.1.id"))
+    assert prove([c], {"cases": {}}, empty_only=True)[0].cannot_fail
+
+
+def test_prove_fills_a_list_path_and_a_key_at_the_top_of_one_answer():
+    c = not_contains("0.name", "category")
+    assert prove([c], {"cases": {}}, empty_only=True)[0].cannot_fail
+
+
+def test_prove_fills_a_checked_field_beneath_another_for_every_empty_value():
+    c = case([{"type": "not_contains", "path": "reply", "value": "sorry"},
+              {"type": "one_of", "path": "reply.text", "value": [None, "sent"]}])
+    assert filled(c) == [{"reply": {"text": value}} for value in ("", None, {}, [])]
+    assert prove([c], {"cases": {}}, empty_only=True)[0].cannot_fail
+
+
+def test_prove_names_only_the_fields_left_empty():
+    c = not_contains("reply", "reply.text", "category")
+    assert empty_decoys(c)[len(EMPTY_DECOYS)][0] == "an answer whose category, reply.text are empty text"
