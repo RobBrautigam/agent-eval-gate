@@ -433,3 +433,8 @@ def test_prove_fills_a_checked_field_beneath_another_for_every_empty_value():
               {"type": "one_of", "path": "reply.text", "value": [None, "sent"]}])
     assert filled(c) == [{"reply": {"text": value}} for value in ("", None, {}, [])]
     assert prove([c], {"cases": {}}, empty_only=True)[0].cannot_fail
+
+
+def test_prove_names_only_the_fields_left_empty():
+    c = not_contains("reply", "reply.text", "category")
+    assert empty_decoys(c)[len(EMPTY_DECOYS)][0] == "an answer whose category, reply.text are empty text"

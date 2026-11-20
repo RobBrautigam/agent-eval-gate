@@ -118,11 +118,12 @@ def empty_decoys(case: Case) -> list[tuple[str, Any]]:
     decoys = list(EMPTY_DECOYS)
     paths = sorted({c["path"] for c in case.checks if isinstance(c.get("path"), str) and c["path"]})
     if paths:
+        empty = [p for p in paths if not any(q.startswith(f"{p}.") for q in paths)]  # the rest hold these
         for label, value in _EMPTY_VALUES:
             answer: Any = {}
             for path in paths:
                 answer = _merge(answer, _with_path(path, value))
-            decoys.append((f"an answer whose {', '.join(paths)} {'is' if len(paths) == 1 else 'are'} {label}",
+            decoys.append((f"an answer whose {', '.join(empty)} {'is' if len(empty) == 1 else 'are'} {label}",
                            answer))
     return decoys
 
