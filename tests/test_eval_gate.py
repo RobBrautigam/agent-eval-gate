@@ -395,10 +395,12 @@ def test_a_candidate_that_starts_returning_bad_token_counts_never_reads_cheaper(
     assert result.lines[1].startswith("FAIL cost/case  unknown")
 
 
-def test_a_case_whose_agent_raised_still_adds_nothing_to_the_cost():
+@pytest.mark.parametrize("stop", [RuntimeError("model timed out"), SystemExit("quota exceeded"),
+                                  asyncio.CancelledError()], ids=["raised", "exited", "canceled"])
+def test_a_case_whose_agent_raised_still_adds_nothing_to_the_cost(stop):
     def agent(value):
         if value == "b":
-            raise RuntimeError("model timed out")
+            raise stop
         return answer_with()
 
     result = score(THREE, record(THREE, agent, "a"), PRICED)
