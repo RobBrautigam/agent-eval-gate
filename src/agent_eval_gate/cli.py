@@ -13,10 +13,11 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import traceback
 from pathlib import Path
 
 from . import __version__
-from .core import EvalError, load_agent, load_cases, load_prices, load_recording, record, save_recording, score, unpriced_models
+from .core import EvalError, _reason, load_agent, load_cases, load_prices, load_recording, record, save_recording, score, unpriced_models
 from .gate import Limits, compare, prove
 from .report import html_page, markdown
 
@@ -145,7 +146,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"agent-eval-gate: {exc}", file=sys.stderr)
         return 2
     except Exception as exc:  # noqa: BLE001 - exit 1 means "the agent got worse"; a crash is never that
-        print(f"agent-eval-gate: {type(exc).__name__}: {exc}", file=sys.stderr)
+        print(f"agent-eval-gate: {_reason(exc)}", file=sys.stderr)
+        return 2
+    except (KeyboardInterrupt, SystemExit):
+        raise  # Ctrl-C keeps Python's own exit, and an exit keeps its own code
+    except BaseException:  # an agent's GeneratorExit or its own BaseException is a crash too: 2, never the gate's 1
+        traceback.print_exc()
         return 2
 
 

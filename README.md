@@ -14,9 +14,10 @@ from the recording as often as you like, for free.
 - **Proof that each case can fail.** A check never seen failing proves nothing. `prove` scores every
   case against empty answers and against every other case's answer, and lists the cases that pass
   anyway.
-- **Honest money.** Cost comes from a price table you keep. A model with no price, or an answer with
-  no token counts, is reported as unknown cost, never as free, and the gate refuses to call an
-  unknown cost a pass.
+- **Honest money.** Cost comes from a price table you keep. A model with no price, an answer with
+  no token counts, or one whose token count or latency was refused, is reported as unknown cost,
+  never as free, and the gate refuses to call an unknown cost a pass. (A recording made before
+  refused answers were marked prices them at $0: record it again.)
 - **Stale answers are refused.** Each answer is stored with a hash of its case's input. Change the
   input and the old answer is never scored against it: the case reads "record again".
 - **No dependencies**, Python 3.11 or newer, one self-contained HTML report, no account.
@@ -62,8 +63,9 @@ pytest
 (On Windows PowerShell, write `$X = "examples/support_triage"` first.) `gate` and `prove` exit 1
 on this example on purpose: that is what they are for. Every command exits 2, with a one-line
 reason, when it cannot run at all (a missing file, an agent that will not load, one that calls
-`sys.exit` or is canceled as it loads included). Ctrl-C still stops a command at once, and so does
-an agent that raises any other exception that is not an `Exception` (see
+`sys.exit` or is canceled as it loads included, a recording that holds a refused number). An agent
+that raises any other exception that is not an `Exception` also stops a command at once, with exit
+2 and Python's own traceback; Ctrl-C stops it with Python's own exit (see
 [Your own agent](#your-own-agent)).
 
 **The example** is a support agent that sorts a ticket (billing, bug, account, how-to), decides
@@ -124,11 +126,18 @@ run, and `record` goes on to the next case; one that calls `sys.exit` or is canc
 will not load, so `record` exits 2 with the reason. A token count, if given, must be a whole number
 of zero or more, of any number type (`300`, `300.0`, a `Decimal` or a numpy number), and a latency,
 if given, a finite number of zero or more that a float can hold: anything else, such as the text
-`"300"`, `2.9`, `-5`, NaN or `True`, fails the case with a reason that names the field. A case that
-fails this way, or by an error, keeps no answer and no token counts, and adds $0 to the cost totals.
-Ctrl-C (`KeyboardInterrupt`) still stops `record` at once, keeping the cases
-answered before it, and so does any other exception that is not an `Exception` (`GeneratorExit`),
-with Python's own traceback. Leave out the token counts and the case's cost is unknown, never $0.
+`"300"`, `2.9`, `-5`, NaN or `True`, fails the case with a reason that names the field ("the agent
+returned a refused number: ..."). A case that fails this way keeps no answer and no token counts,
+and its cost is unknown, never $0, since the agent did answer; a case whose agent raised, exited or
+was canceled adds $0 to the cost totals. A recording made before refused cases were marked reads
+such a case as raised, at $0: record it again. A token count, or a cost, too large for a float
+makes that case's cost unknown; a count of more than 4,300 digits (Python's default limit for
+writing a number as text) stops `record` with exit 2 and saves nothing. `score`, `gate` and `prove`
+hold a recording to the same rules when they load it (one edited by hand, or made by an older
+version) and exit 2 with a reason that names the case. Ctrl-C (`KeyboardInterrupt`) still stops
+`record` at once with Python's own exit, keeping the cases answered before it; any other exception
+that is not an `Exception` (`GeneratorExit`) stops it the same way, but with exit 2 and Python's own
+traceback. Leave out the token counts and the case's cost is unknown, never $0.
 `agent_eval_gate.Reply` is the same shape as a dataclass.
 This repository never calls a model itself: what your function calls, and what that costs, is yours.
 
