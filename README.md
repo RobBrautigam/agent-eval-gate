@@ -16,7 +16,8 @@ from the recording as often as you like, for free.
   anyway.
 - **Honest money.** Cost comes from a price table you keep. A model with no price, an answer with
   no token counts, or one whose token count or latency was refused, is reported as unknown cost,
-  never as free, and the gate refuses to call an unknown cost a pass.
+  never as free, and the gate refuses to call an unknown cost a pass. (A recording made before
+  refused answers were marked prices them at $0: record it again.)
 - **Stale answers are refused.** Each answer is stored with a hash of its case's input. Change the
   input and the old answer is never scored against it: the case reads "record again".
 - **No dependencies**, Python 3.11 or newer, one self-contained HTML report, no account.
@@ -128,13 +129,15 @@ if given, a finite number of zero or more that a float can hold: anything else, 
 `"300"`, `2.9`, `-5`, NaN or `True`, fails the case with a reason that names the field ("the agent
 returned a refused number: ..."). A case that fails this way keeps no answer and no token counts,
 and its cost is unknown, never $0, since the agent did answer; a case whose agent raised, exited or
-was canceled adds $0 to the cost totals. A token count, or a cost, too large for a float makes that
-case's cost unknown. `score`, `gate` and `prove` hold a recording to the same rules when they load
-it (one edited by hand, or made by an older version) and exit 2 with a reason that names the case.
-Ctrl-C (`KeyboardInterrupt`) still stops `record` at once, keeping the cases
-answered before it, and so does any other exception that is not an `Exception` (`GeneratorExit`),
-with exit 2 and Python's own traceback. Leave out the token counts and the case's cost is unknown,
-never $0.
+was canceled adds $0 to the cost totals. A recording made before refused cases were marked reads
+such a case as raised, at $0: record it again. A token count, or a cost, too large for a float
+makes that case's cost unknown; a count of more than 4,300 digits (Python's default limit for
+writing a number as text) stops `record` with exit 2 and saves nothing. `score`, `gate` and `prove`
+hold a recording to the same rules when they load it (one edited by hand, or made by an older
+version) and exit 2 with a reason that names the case. Ctrl-C (`KeyboardInterrupt`) still stops
+`record` at once with Python's own exit, keeping the cases answered before it; any other exception
+that is not an `Exception` (`GeneratorExit`) stops it the same way, but with exit 2 and Python's own
+traceback. Leave out the token counts and the case's cost is unknown, never $0.
 `agent_eval_gate.Reply` is the same shape as a dataclass.
 This repository never calls a model itself: what your function calls, and what that costs, is yours.
 
