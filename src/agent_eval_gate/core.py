@@ -6,10 +6,12 @@ latency. Scoring reads a recording, never the agent, so changing a check costs n
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib
 import importlib.util
 import json
+import numbers
 import os
 import math
 import re
@@ -253,7 +255,9 @@ def load_agent(spec: str) -> Callable[[Any], Any]:
             module = importlib.import_module(target)
     except EvalError:
         raise
-    except (ImportError, SyntaxError) as exc:
+    # SystemExit and CancelledError are not an Exception, so without them here an agent file that calls
+    # sys.exit("missing API key") would end the command with its own code; Ctrl-C still stops it
+    except (ImportError, SyntaxError, SystemExit, asyncio.CancelledError) as exc:
         raise EvalError(f"cannot load the agent {target}: {type(exc).__name__}: {exc}") from None
     fn = getattr(module, name, None)
     if not callable(fn):
@@ -265,13 +269,29 @@ def _as_reply(answer: Any) -> Reply:
     if isinstance(answer, Reply):
         return answer
     if isinstance(answer, dict) and "output" in answer:
-        return Reply(answer["output"], answer.get("model"), _count(answer.get("input_tokens")),
-                     _count(answer.get("output_tokens")), answer.get("latency_ms"))
+        return Reply(answer["output"], answer.get("model"), answer.get("input_tokens"),
+                     answer.get("output_tokens"), answer.get("latency_ms"))
     return Reply(answer)
 
 
-def _count(value: Any) -> int | None:
-    return None if value is None else int(value)
+def _count(value: Any, name: str) -> int | None:
+    """A token count as reported: None (not reported), or a whole number of zero or more. Text such as
+    "300", a fraction, a negative, NaN or true is refused rather than read, so it is never priced."""
+    if value is None:
+        return None
+    whole = ((isinstance(value, numbers.Integral) and not isinstance(value, bool))
+             or (isinstance(value, float) and value.is_integer()))
+    if not whole or value < 0:
+        raise ValueError(f"{name} must be a whole number of zero or more, got {value!r}")
+    return int(value)
+
+
+def _latency(value: Any) -> float:
+    """An agent's own latency: a finite number of milliseconds, zero or more (a NaN would break p95)."""
+    if (isinstance(value, bool) or not isinstance(value, numbers.Real) or not math.isfinite(value)
+            or value < 0):
+        raise ValueError(f"latency_ms must be a finite number of zero or more, got {value!r}")
+    return float(value)
 
 
 def record(cases: list[Case], agent: Callable[[Any], Any], agent_name: str,
@@ -294,14 +314,16 @@ def record(cases: list[Case], agent: Callable[[Any], Any], agent_name: str,
                 # default=str: an answer that is not JSON (an SDK object) is kept as its text
                 "output": json.loads(json.dumps(reply.output, ensure_ascii=False, default=str)),
                 "model": None if reply.model is None else str(reply.model),
-                "input_tokens": _count(reply.input_tokens),
-                "output_tokens": _count(reply.output_tokens),
-                "latency_ms": round(float(reply.latency_ms if reply.latency_ms is not None else wall_ms), 3),
+                "input_tokens": _count(reply.input_tokens, "input_tokens"),
+                "output_tokens": _count(reply.output_tokens, "output_tokens"),
+                "latency_ms": round(_latency(reply.latency_ms) if reply.latency_ms is not None else wall_ms, 3),
                 "latency_source": "agent" if reply.latency_ms is not None else "wall clock",
                 "error": None,
             }
-        except Exception as exc:  # an agent that raises, or answers in a shape that cannot be kept,
-            wall_ms = (time.perf_counter() - started) * 1000  # is a failing case, not a crashed run
+        # an agent that raises, calls sys.exit, is cancelled, or answers in a shape that cannot be kept
+        # is a failing case, not a crashed run; Ctrl-C (KeyboardInterrupt) still stops the run
+        except (Exception, SystemExit, asyncio.CancelledError) as exc:
+            wall_ms = (time.perf_counter() - started) * 1000
             entry = {"input_hash": case.input_hash, "output": None, "model": None, "input_tokens": None,
                      "output_tokens": None, "latency_ms": round(wall_ms, 3), "latency_source": "wall clock",
                      "error": f"{type(exc).__name__}: {exc}"}

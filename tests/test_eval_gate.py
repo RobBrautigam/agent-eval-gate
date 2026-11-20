@@ -429,7 +429,7 @@ def test_prove_fills_a_list_path_and_a_key_at_the_top_of_one_answer():
 
 
 def test_prove_fills_a_checked_field_beneath_another_for_every_empty_value():
-    c = case([{"type": "not_contains", "path": "reply", "value": "x"},
+    c = case([{"type": "not_contains", "path": "reply", "value": "sorry"},
               {"type": "one_of", "path": "reply.text", "value": [None, "sent"]}])
     assert filled(c) == [{"reply": {"text": value}} for value in ("", None, {}, [])]
     assert prove([c], {"cases": {}}, empty_only=True)[0].cannot_fail
