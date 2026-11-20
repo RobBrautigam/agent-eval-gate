@@ -62,7 +62,8 @@ pytest
 (On Windows PowerShell, write `$X = "examples/support_triage"` first.) `gate` and `prove` exit 1
 on this example on purpose: that is what they are for. Every command exits 2, with a one-line
 reason, when it cannot run at all (a missing file, an agent that will not load), unless the agent
-calls `sys.exit` (see [Your own agent](#your-own-agent)).
+calls `sys.exit` or raises an exception that is not an `Exception` (see
+[Your own agent](#your-own-agent)).
 
 **The example** is a support agent that sorts a ticket (billing, bug, account, how-to), decides
 whether a person should take it, and drafts a reply, over 11 tickets. Version 2 is the change a team
@@ -122,8 +123,10 @@ its reason, not a crashed run. A count `int()` can read is kept as it reads it (
 `2.9` is 2, `True` is 1, a negative count stays negative), and so is a negative, NaN or infinite
 latency. An agent that calls `sys.exit`, as it loads or on a case, ends `record` there with the
 code it passed to `sys.exit` (1 for a message, 0 for none), keeping the cases answered before it
-and printing no reason of its own. Leave out the token counts and the case's cost is unknown,
-never $0. `agent_eval_gate.Reply` is the same shape as a dataclass.
+and printing no reason of its own. Any other exception that is not an `Exception`
+(`KeyboardInterrupt`, `asyncio.CancelledError`) also ends `record` there, keeping the cases
+answered before it, with Python's own traceback and exit code. Leave out the token counts and the
+case's cost is unknown, never $0. `agent_eval_gate.Reply` is the same shape as a dataclass.
 This repository never calls a model itself: what your function calls, and what that costs, is yours.
 
 ## Case files
@@ -183,8 +186,8 @@ your suite's size in mind. Latency is whatever was measured when the recording w
 
 Each case is scored against decoys:
 
-1. **Empty answers**: an empty string, nothing, an empty object, and answers that hold every field
-   the case's checks read with nothing in it (empty text, null, an empty object, an empty list). A
+1. **Empty answers**: an empty string, nothing, an empty object, and answers that hold the fields
+   the case's checks read with nothing in them (empty text, null, an empty object, an empty list). A
    case that passes one **cannot fail**. Under a list some fields are left out of these answers:
    with `actions.0.id` and `actions.0.name` only `actions.0.id` is filled, and a field under the
    first item of a list at the top of the answer (`0.name`) never is, so `prove` can miss a case
