@@ -288,17 +288,22 @@ def _finite(value: Any) -> bool:
         return False
 
 
-def _refused(name: str, rule: str, value: Any) -> ValueError:
+class _Refused(ValueError):
+    """A number the agent returned (or a recording holds) that breaks the rules below."""
+
+
+def _refused(name: str, rule: str, value: Any) -> _Refused:
     try:
         shown = repr(value)
     except Exception:  # an int too long to print, or a repr that raises
         shown = f"a {type(value).__name__}"
-    return ValueError(f"{name} must be {rule}, got {shown if len(shown) <= 60 else shown[:57] + '...'}")
+    return _Refused(f"{name} must be {rule}, got {shown if len(shown) <= 60 else shown[:57] + '...'}")
 
 
 def _count(value: Any, name: str) -> int | None:
     """A token count as reported: None (not reported), or a whole number of zero or more of any number type.
-    Text such as "300", a fraction, a negative, NaN or true is refused rather than read: the case fails."""
+    Text such as "300", a fraction, a negative, NaN or true is refused rather than read: the case fails, and
+    its cost is unknown."""
     if value is None:
         return None
     if not _finite(value) or value < 0 or value != int(value):
@@ -351,17 +356,24 @@ def record(cases: list[Case], agent: Callable[[Any], Any], agent_name: str,
                 "latency_source": "agent" if reply.latency_ms is not None else "wall clock",
                 "error": None,
             }
+        # a number the agent returned that the rules refuse fails the case; marked, so its cost reads unknown
+        except _Refused as exc:
+            entry = _failed(case, started, f"ValueError: {exc}")
+            entry["refused"] = True
         # an agent that raises, calls sys.exit, is canceled, or answers in a shape that cannot be kept
         # is a failing case, not a crashed run; Ctrl-C (KeyboardInterrupt) still stops the run
         except (Exception, SystemExit, asyncio.CancelledError) as exc:
-            wall_ms = (time.perf_counter() - started) * 1000
-            entry = {"input_hash": case.input_hash, "output": None, "model": None, "input_tokens": None,
-                     "output_tokens": None, "latency_ms": round(wall_ms, 3), "latency_source": "wall clock",
-                     "error": _reason(exc)}
+            entry = _failed(case, started, _reason(exc))
         recording["cases"][case.id] = entry
         if on_case:
             on_case(recording)
     return recording
+
+
+def _failed(case: Case, started: float, error: str) -> dict:
+    wall_ms = (time.perf_counter() - started) * 1000
+    return {"input_hash": case.input_hash, "output": None, "model": None, "input_tokens": None,
+            "output_tokens": None, "latency_ms": round(wall_ms, 3), "latency_source": "wall clock", "error": error}
 
 
 def save_recording(recording: dict, path: str | Path) -> None:
@@ -379,8 +391,20 @@ def load_recording(path: str | Path) -> dict:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as exc:
         raise EvalError(f"cannot read the recording {path}: {exc}") from None
-    if data.get("format") != FORMAT_VERSION or not isinstance(data.get("cases"), dict):
+    if not isinstance(data, dict) or data.get("format") != FORMAT_VERSION or not isinstance(data.get("cases"), dict):
         raise EvalError(f"{path} is not a recording this version can read")
+    # the rules `record` holds an agent's numbers to, held again here: a recording edited by hand, or made by
+    # an older version, could otherwise carry a count of "300" or -5, or a NaN latency, into the score
+    for cid, entry in data["cases"].items():
+        if not isinstance(entry, dict):
+            raise EvalError(f"{path}: case {cid!r} is not a JSON object")
+        try:
+            _count(entry.get("input_tokens"), "input_tokens")
+            _count(entry.get("output_tokens"), "output_tokens")
+            if entry.get("latency_ms") is not None:
+                _latency(entry["latency_ms"])
+        except _Refused as exc:
+            raise EvalError(f"{path}: case {cid!r}: {exc}") from None
     return data
 
 
@@ -487,7 +511,8 @@ def _reported(entry: dict) -> bool:
 
 def _cost(entry: dict, prices: dict[str, tuple[float, float]]) -> float | None:
     if entry.get("error"):
-        return 0.0  # a failing case (the call raised, or a number it reported was refused) is not priced
+        # a refused number: the agent answered, so the call cost something nobody can know; a raise is not priced
+        return None if entry.get("refused") else 0.0
     if not _reported(entry):
         return None  # no token counts: unknown, never free
     tokens_in, tokens_out = int(entry.get("input_tokens") or 0), int(entry.get("output_tokens") or 0)
