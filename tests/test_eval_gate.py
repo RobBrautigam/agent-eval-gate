@@ -4,6 +4,8 @@ import asyncio
 import json
 import subprocess
 import sys
+from decimal import Decimal
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
@@ -318,6 +320,46 @@ def test_whole_token_counts_and_finite_latencies_are_kept():
     assert recorded(answer_with(latency_ms=0))["latency_ms"] == 0
 
 
+@pytest.mark.parametrize("count", [Decimal("300"), Decimal("300.0"), Fraction(300)],
+                         ids=["decimal", "decimal-with-a-point", "fraction"])
+def test_a_whole_count_of_any_number_type_is_kept_as_an_int(count):
+    entry = recorded(answer_with(input_tokens=count, output_tokens=count))
+    assert entry["error"] is None
+    assert (entry["input_tokens"], entry["output_tokens"]) == (300, 300)
+    assert type(entry["input_tokens"]) is int and type(entry["output_tokens"]) is int
+
+
+@pytest.mark.parametrize("latency", [Decimal("500"), Fraction(1, 2)], ids=["decimal", "fraction"])
+def test_a_finite_latency_of_any_number_type_is_kept_as_a_float(latency):
+    entry = recorded(answer_with(latency_ms=latency))
+    assert entry["error"] is None and entry["latency_ms"] == float(latency)
+    assert type(entry["latency_ms"]) is float
+
+
+def test_numpy_numbers_meet_the_same_rule():
+    np = pytest.importorskip("numpy")
+    entry = recorded(answer_with(input_tokens=np.float32(300.0), output_tokens=np.int64(2),
+                                 latency_ms=np.float32(12.5)))
+    assert entry["error"] is None
+    assert (entry["input_tokens"], entry["output_tokens"], entry["latency_ms"]) == (300, 2, 12.5)
+    assert "input_tokens must be a whole number" in (recorded(answer_with(input_tokens=np.float32(2.5)))["error"] or "")
+
+
+@pytest.mark.parametrize("count", [Decimal("2.5"), Decimal("-1"), Decimal("NaN"), Decimal("Infinity"), Fraction(5, 2)],
+                         ids=["decimal-fraction", "decimal-negative", "decimal-nan", "decimal-infinite", "fraction"])
+def test_a_count_of_another_number_type_meets_the_same_rule(count):
+    entry = recorded(answer_with(input_tokens=count))
+    assert (entry["error"] or "").startswith("ValueError: input_tokens must be a whole number of zero or more")
+
+
+@pytest.mark.parametrize("latency", [Decimal("-1"), Decimal("NaN"), Decimal("1e400"), 10 ** 400, 10 ** 5000],
+                         ids=["decimal-negative", "decimal-nan", "decimal-too-large", "too-large", "too-long-to-print"])
+def test_a_latency_of_another_number_type_or_too_large_for_a_float_meets_the_same_rule(latency):
+    error = recorded(answer_with(latency_ms=latency))["error"] or ""
+    assert error.startswith("ValueError: latency_ms must be a finite number of zero or more")
+    assert len(error) < 200  # the value is shown cut short, never as thousands of digits
+
+
 # ------------------------------------------------------------- an agent that exits or is canceled
 
 def agent_file(tmp_path: Path, body: str) -> str:
@@ -367,6 +409,21 @@ def test_an_agent_canceled_on_a_case_fails_that_case_and_the_run_goes_on():
     rec = record(THREE, agent, "a")
     assert (rec["cases"]["b"]["error"] or "").startswith("CancelledError")
     assert [rec["cases"][cid]["error"] for cid in ("a", "c")] == [None, None]
+
+
+def test_an_exit_or_a_cancel_with_no_message_is_named_with_no_empty_reason(tmp_path):
+    def agent(value):
+        if value == "b":
+            sys.exit()
+        if value == "c":
+            raise asyncio.CancelledError()
+        return "ok"
+
+    rec = record(THREE, agent, "a")
+    assert [rec["cases"][cid]["error"] for cid in ("b", "c")] == ["SystemExit", "CancelledError"]
+    with pytest.raises(EvalError) as raised:
+        load_agent(agent_file(tmp_path, "import sys\nsys.exit()\n\ndef run(v):\n    return v\n"))
+    assert str(raised.value).endswith(": SystemExit")
 
 
 def test_the_command_line_records_past_an_agent_that_calls_sys_exit_on_a_case(tmp_path):
