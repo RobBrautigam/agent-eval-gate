@@ -320,7 +320,7 @@ def record(cases: list[Case], agent: Callable[[Any], Any], agent_name: str,
                 "latency_source": "agent" if reply.latency_ms is not None else "wall clock",
                 "error": None,
             }
-        # an agent that raises, calls sys.exit, is cancelled, or answers in a shape that cannot be kept
+        # an agent that raises, calls sys.exit, is canceled, or answers in a shape that cannot be kept
         # is a failing case, not a crashed run; Ctrl-C (KeyboardInterrupt) still stops the run
         except (Exception, SystemExit, asyncio.CancelledError) as exc:
             wall_ms = (time.perf_counter() - started) * 1000

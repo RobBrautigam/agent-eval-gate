@@ -318,7 +318,7 @@ def test_whole_token_counts_and_finite_latencies_are_kept():
     assert recorded(answer_with(latency_ms=0))["latency_ms"] == 0
 
 
-# ------------------------------------------------------------- an agent that exits or is cancelled
+# ------------------------------------------------------------- an agent that exits or is canceled
 
 def agent_file(tmp_path: Path, body: str) -> str:
     path = tmp_path / "agent_under_test.py"
@@ -335,7 +335,7 @@ def test_an_agent_that_calls_sys_exit_as_it_loads_will_not_load(tmp_path):
         load_agent(agent_file(tmp_path, EXITS_AS_IT_LOADS))
 
 
-def test_an_agent_cancelled_as_it_loads_will_not_load(tmp_path):
+def test_an_agent_canceled_as_it_loads_will_not_load(tmp_path):
     with pytest.raises(EvalError, match="cannot load the agent .*CancelledError"):
         load_agent(agent_file(tmp_path, "import asyncio\nraise asyncio.CancelledError()\n\ndef run(v):\n    return v\n"))
 
@@ -358,7 +358,7 @@ def test_an_agent_that_calls_sys_exit_on_a_case_fails_that_case_and_the_run_goes
     assert [c.passed for c in score(THREE, rec, {}).cases] == [True, False, True]
 
 
-def test_an_agent_cancelled_on_a_case_fails_that_case_and_the_run_goes_on():
+def test_an_agent_canceled_on_a_case_fails_that_case_and_the_run_goes_on():
     def agent(value):
         if value == "b":
             raise asyncio.CancelledError()
@@ -391,6 +391,18 @@ def test_ctrl_c_still_stops_the_run(tmp_path):
     assert saved == [["a"]]  # the cases answered before it are kept
     with pytest.raises(KeyboardInterrupt):
         load_agent(agent_file(tmp_path, "raise KeyboardInterrupt\n\ndef run(v):\n    return v\n"))
+
+
+def test_any_other_exception_that_is_not_an_exception_still_stops_the_run(tmp_path):
+    def agent(value):
+        if value == "b":
+            raise GeneratorExit
+        return "ok"
+
+    with pytest.raises(GeneratorExit):
+        record(THREE, agent, "a")
+    with pytest.raises(GeneratorExit):
+        load_agent(agent_file(tmp_path, "raise GeneratorExit\n\ndef run(v):\n    return v\n"))
 
 
 # ------------------------------------------------------------- the empty answers prove builds
