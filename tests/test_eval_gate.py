@@ -360,6 +360,14 @@ def test_a_latency_of_another_number_type_or_too_large_for_a_float_meets_the_sam
     assert len(error) < 200  # the value is shown cut short, never as thousands of digits
 
 
+def test_a_case_failed_by_a_refused_number_keeps_no_answer_and_adds_nothing_to_the_cost():
+    c = case([{"type": "equals", "value": "ok"}])
+    entry = recorded(answer_with(input_tokens=3, output_tokens=2, latency_ms="500"))
+    assert (entry["output"], entry["input_tokens"], entry["output_tokens"]) == (None, None, None)
+    scored = score([c], {"cases": {"c": entry}}, {"m": (1_000_000.0, 1_000_000.0)})
+    assert (scored.cases[0].passed, scored.cases[0].cost_usd, scored.cost_total) == (False, 0.0, 0.0)
+
+
 # ------------------------------------------------------------- an agent that exits or is canceled
 
 def agent_file(tmp_path: Path, body: str) -> str:

@@ -122,9 +122,11 @@ packages). An agent that raises an `Exception`, calls `sys.exit` or is canceled
 (`asyncio.CancelledError`) on a case is a failing case with the error as its reason, not a crashed
 run, and `record` goes on to the next case; one that calls `sys.exit` or is canceled as it loads
 will not load, so `record` exits 2 with the reason. A token count, if given, must be a whole number
-of zero or more (`300`, or `300.0`), and a latency, if given, a finite number of zero or more:
-anything else, such as the text `"300"`, `2.9`, `-5`, NaN or `True`, fails the case with a reason
-that names the field. Ctrl-C (`KeyboardInterrupt`) still stops `record` at once, keeping the cases
+of zero or more, of any number type (`300`, `300.0`, a `Decimal` or a numpy number), and a latency,
+if given, a finite number of zero or more that a float can hold: anything else, such as the text
+`"300"`, `2.9`, `-5`, NaN or `True`, fails the case with a reason that names the field. A case that
+fails this way, or by an error, keeps no answer and no token counts, and adds $0 to the cost totals.
+Ctrl-C (`KeyboardInterrupt`) still stops `record` at once, keeping the cases
 answered before it, and so does any other exception that is not an `Exception` (`GeneratorExit`),
 with Python's own traceback. Leave out the token counts and the case's cost is unknown, never $0.
 `agent_eval_gate.Reply` is the same shape as a dataclass.

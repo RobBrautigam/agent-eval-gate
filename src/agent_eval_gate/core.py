@@ -7,6 +7,7 @@ latency. Scoring reads a recording, never the agent, so changing a check costs n
 from __future__ import annotations
 
 import asyncio
+import decimal
 import hashlib
 import importlib
 import importlib.util
@@ -258,7 +259,7 @@ def load_agent(spec: str) -> Callable[[Any], Any]:
     # SystemExit and CancelledError are not an Exception, so without them here an agent file that calls
     # sys.exit("missing API key") would end the command with its own code; Ctrl-C still stops it
     except (ImportError, SyntaxError, SystemExit, asyncio.CancelledError) as exc:
-        raise EvalError(f"cannot load the agent {target}: {type(exc).__name__}: {exc}") from None
+        raise EvalError(f"cannot load the agent {target}: {_reason(exc)}") from None
     fn = getattr(module, name, None)
     if not callable(fn):
         raise EvalError(f"{target} has no function {name!r}")
@@ -274,24 +275,54 @@ def _as_reply(answer: Any) -> Reply:
     return Reply(answer)
 
 
+def _finite(value: Any) -> bool:
+    """A number of any type (int, float, Decimal, Fraction, numpy's) that is not NaN or infinite; never text,
+    true or false."""
+    if isinstance(value, bool) or not isinstance(value, (numbers.Real, decimal.Decimal)):
+        return False
+    if isinstance(value, decimal.Decimal):
+        return value.is_finite()
+    try:
+        return isinstance(value, numbers.Rational) or math.isfinite(value)
+    except (OverflowError, TypeError, ValueError):
+        return False
+
+
+def _refused(name: str, rule: str, value: Any) -> ValueError:
+    try:
+        shown = repr(value)
+    except Exception:  # an int too long to print, or a repr that raises
+        shown = f"a {type(value).__name__}"
+    return ValueError(f"{name} must be {rule}, got {shown if len(shown) <= 60 else shown[:57] + '...'}")
+
+
 def _count(value: Any, name: str) -> int | None:
-    """A token count as reported: None (not reported), or a whole number of zero or more. Text such as
-    "300", a fraction, a negative, NaN or true is refused rather than read, so it is never priced."""
+    """A token count as reported: None (not reported), or a whole number of zero or more of any number type.
+    Text such as "300", a fraction, a negative, NaN or true is refused rather than read: the case fails."""
     if value is None:
         return None
-    whole = ((isinstance(value, numbers.Integral) and not isinstance(value, bool))
-             or (isinstance(value, float) and value.is_integer()))
-    if not whole or value < 0:
-        raise ValueError(f"{name} must be a whole number of zero or more, got {value!r}")
+    if not _finite(value) or value < 0 or value != int(value):
+        raise _refused(name, "a whole number of zero or more", value)
     return int(value)
 
 
 def _latency(value: Any) -> float:
-    """An agent's own latency: a finite number of milliseconds, zero or more (a NaN would break p95)."""
-    if (isinstance(value, bool) or not isinstance(value, numbers.Real) or not math.isfinite(value)
-            or value < 0):
-        raise ValueError(f"latency_ms must be a finite number of zero or more, got {value!r}")
-    return float(value)
+    """An agent's own latency: a finite number of milliseconds, zero or more, that a float can hold (a NaN
+    would break p95, and the recording is JSON)."""
+    if _finite(value) and value >= 0:
+        try:
+            ms = float(value)
+        except OverflowError:
+            ms = math.inf
+        if math.isfinite(ms):
+            return ms
+    raise _refused("latency_ms", "a finite number of zero or more that a float can hold", value)
+
+
+def _reason(exc: BaseException) -> str:
+    """The exception's name, then its message when it has one (`sys.exit()` reads "SystemExit", not "SystemExit: ")."""
+    message = str(exc)
+    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
 
 
 def record(cases: list[Case], agent: Callable[[Any], Any], agent_name: str,
@@ -326,7 +357,7 @@ def record(cases: list[Case], agent: Callable[[Any], Any], agent_name: str,
             wall_ms = (time.perf_counter() - started) * 1000
             entry = {"input_hash": case.input_hash, "output": None, "model": None, "input_tokens": None,
                      "output_tokens": None, "latency_ms": round(wall_ms, 3), "latency_source": "wall clock",
-                     "error": f"{type(exc).__name__}: {exc}"}
+                     "error": _reason(exc)}
         recording["cases"][case.id] = entry
         if on_case:
             on_case(recording)
@@ -456,7 +487,7 @@ def _reported(entry: dict) -> bool:
 
 def _cost(entry: dict, prices: dict[str, tuple[float, float]]) -> float | None:
     if entry.get("error"):
-        return 0.0  # the call raised: there is no answer to price
+        return 0.0  # a failing case (the call raised, or a number it reported was refused) is not priced
     if not _reported(entry):
         return None  # no token counts: unknown, never free
     tokens_in, tokens_out = int(entry.get("input_tokens") or 0), int(entry.get("output_tokens") or 0)
