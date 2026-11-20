@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 import sys
@@ -9,7 +10,7 @@ import pytest
 
 from agent_eval_gate.core import (Case, EvalError, Reply, load_agent, load_cases, load_prices, percentile,
                                   record, run_checks, score)
-from agent_eval_gate.gate import Limits, compare, prove
+from agent_eval_gate.gate import EMPTY_DECOYS, Limits, compare, empty_decoys, prove
 from agent_eval_gate.report import html_page
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -277,3 +278,158 @@ def test_prove_fills_the_fields_a_check_reads():
     c = case([{"type": "not_contains", "path": "reply", "value": "as an AI"}])
     found = prove([c], {"cases": {}})
     assert found and found[0].cannot_fail and any("reply" in label for label in found[0].passes_on)
+
+
+# ------------------------------------------------------------- numbers an agent reports
+
+def answer_with(**fields) -> dict:
+    return {"output": "ok", "model": "m", "input_tokens": 1, "output_tokens": 1, **fields}
+
+
+def recorded(answer) -> dict:
+    return record([case([{"type": "equals", "value": "ok"}])], lambda _v: answer, "a")["cases"]["c"]
+
+
+@pytest.mark.parametrize("count", ["300", 2.9, -5, float("nan"), True],
+                         ids=["text", "fractional", "negative", "nan", "true"])
+def test_a_token_count_that_is_not_a_whole_number_of_zero_or_more_is_a_failing_case(count):
+    entry = recorded(answer_with(input_tokens=count))
+    assert (entry["error"] or "").startswith("ValueError: input_tokens must be a whole number of zero or more")
+    assert entry["input_tokens"] is None
+
+
+def test_output_tokens_and_a_reply_object_meet_the_same_rule():
+    assert "output_tokens must be a whole number" in (recorded(answer_with(output_tokens=-1))["error"] or "")
+    assert "input_tokens must be a whole number" in (recorded(Reply("ok", "m", 2.5, 1))["error"] or "")
+
+
+@pytest.mark.parametrize("latency", [-3, float("inf"), float("nan"), "500", True],
+                         ids=["negative", "infinite", "nan", "text", "true"])
+def test_a_latency_that_is_not_a_finite_number_of_zero_or_more_is_a_failing_case(latency):
+    entry = recorded(answer_with(latency_ms=latency))
+    assert (entry["error"] or "").startswith("ValueError: latency_ms must be a finite number of zero or more")
+
+
+def test_whole_token_counts_and_finite_latencies_are_kept():
+    entry = recorded(answer_with(input_tokens=300.0, output_tokens=0, latency_ms=12.5))
+    assert entry["error"] is None
+    assert (entry["input_tokens"], entry["output_tokens"], entry["latency_ms"]) == (300, 0, 12.5)
+    assert type(entry["input_tokens"]) is int
+    assert recorded(answer_with(latency_ms=0))["latency_ms"] == 0
+
+
+# ------------------------------------------------------------- an agent that exits or is cancelled
+
+def agent_file(tmp_path: Path, body: str) -> str:
+    path = tmp_path / "agent_under_test.py"
+    path.write_text(body, encoding="utf-8")
+    return f"{path}:run"
+
+
+EXITS_AS_IT_LOADS = 'import sys\nsys.exit("missing API key")\n\ndef run(v):\n    return v\n'
+THREE = [case([{"type": "equals", "value": "ok"}], cid, cid) for cid in ("a", "b", "c")]
+
+
+def test_an_agent_that_calls_sys_exit_as_it_loads_will_not_load(tmp_path):
+    with pytest.raises(EvalError, match="cannot load the agent .*SystemExit: missing API key"):
+        load_agent(agent_file(tmp_path, EXITS_AS_IT_LOADS))
+
+
+def test_an_agent_cancelled_as_it_loads_will_not_load(tmp_path):
+    with pytest.raises(EvalError, match="cannot load the agent .*CancelledError"):
+        load_agent(agent_file(tmp_path, "import asyncio\nraise asyncio.CancelledError()\n\ndef run(v):\n    return v\n"))
+
+
+def test_the_command_line_exits_2_for_an_agent_that_calls_sys_exit_as_it_loads(tmp_path):
+    result = cli("record", str(EXAMPLE / "cases.jsonl"), "--agent", agent_file(tmp_path, EXITS_AS_IT_LOADS),
+                 "--out", str(tmp_path / "r.json"), cwd=tmp_path)
+    assert result.returncode == 2, result.stderr
+    assert "cannot load the agent" in result.stderr and "missing API key" in result.stderr
+
+
+def test_an_agent_that_calls_sys_exit_on_a_case_fails_that_case_and_the_run_goes_on():
+    def agent(value):
+        if value == "b":
+            sys.exit("quota exceeded")
+        return "ok"
+
+    rec = record(THREE, agent, "a")
+    assert [rec["cases"][cid]["error"] for cid in ("a", "b", "c")] == [None, "SystemExit: quota exceeded", None]
+    assert [c.passed for c in score(THREE, rec, {}).cases] == [True, False, True]
+
+
+def test_an_agent_cancelled_on_a_case_fails_that_case_and_the_run_goes_on():
+    def agent(value):
+        if value == "b":
+            raise asyncio.CancelledError()
+        return "ok"
+
+    rec = record(THREE, agent, "a")
+    assert (rec["cases"]["b"]["error"] or "").startswith("CancelledError")
+    assert [rec["cases"][cid]["error"] for cid in ("a", "c")] == [None, None]
+
+
+def test_the_command_line_records_past_an_agent_that_calls_sys_exit_on_a_case(tmp_path):
+    cases = write_cases(tmp_path, [{"id": cid, "input": cid, "checks": [{"type": "equals", "value": "ok"}]}
+                                   for cid in ("a", "b", "c")])
+    spec = agent_file(tmp_path, 'import sys\n\ndef run(v):\n    if v == "b":\n        sys.exit("quota exceeded")\n'
+                                '    return "ok"\n')
+    result = cli("record", str(cases), "--agent", spec, "--out", str(tmp_path / "r.json"), cwd=tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "recorded 3 case(s)" in result.stdout and "(1 raised)" in result.stdout
+
+
+def test_ctrl_c_still_stops_the_run(tmp_path):
+    def agent(value):
+        if value == "b":
+            raise KeyboardInterrupt
+        return "ok"
+
+    saved: list[list[str]] = []
+    with pytest.raises(KeyboardInterrupt):
+        record(THREE, agent, "a", on_case=lambda rec: saved.append(list(rec["cases"])))
+    assert saved == [["a"]]  # the cases answered before it are kept
+    with pytest.raises(KeyboardInterrupt):
+        load_agent(agent_file(tmp_path, "raise KeyboardInterrupt\n\ndef run(v):\n    return v\n"))
+
+
+# ------------------------------------------------------------- the empty answers prove builds
+
+def filled(c: Case) -> list:
+    """The empty answers that hold the fields the case's checks read, one per empty value."""
+    return [decoy for _label, decoy in empty_decoys(c)[len(EMPTY_DECOYS):]]
+
+
+def not_contains(*paths: str) -> Case:
+    return case([{"type": "not_contains", "path": path, "value": "x"} for path in paths])
+
+
+def test_prove_fills_two_fields_under_one_list_item():
+    c = not_contains("actions.0.id", "actions.0.name")
+    assert filled(c)[0] == {"actions": [{"id": "", "name": ""}]}
+    assert prove([c], {"cases": {}}, empty_only=True)[0].cannot_fail
+
+
+def test_prove_fills_a_path_into_a_list_at_the_top_of_the_answer():
+    c = not_contains("0.name")
+    assert filled(c) == [[{"name": ""}], [{"name": None}], [{"name": {}}], [{"name": []}]]
+    assert prove([c], {"cases": {}}, empty_only=True)[0].cannot_fail
+
+
+def test_prove_fills_two_items_of_one_list():
+    c = not_contains("actions.0.id", "actions.1.id")
+    assert all(run_checks(case([{"type": "equals", "path": p, "value": ""}]), filled(c)[0]) == []
+               for p in ("actions.0.id", "actions.1.id"))
+    assert prove([c], {"cases": {}}, empty_only=True)[0].cannot_fail
+
+
+def test_prove_fills_a_list_path_and_a_key_at_the_top_of_one_answer():
+    c = not_contains("0.name", "category")
+    assert prove([c], {"cases": {}}, empty_only=True)[0].cannot_fail
+
+
+def test_prove_fills_a_checked_field_beneath_another_for_every_empty_value():
+    c = case([{"type": "not_contains", "path": "reply", "value": "x"},
+              {"type": "one_of", "path": "reply.text", "value": [None, "sent"]}])
+    assert filled(c) == [{"reply": {"text": value}} for value in ("", None, {}, [])]
+    assert prove([c], {"cases": {}}, empty_only=True)[0].cannot_fail
