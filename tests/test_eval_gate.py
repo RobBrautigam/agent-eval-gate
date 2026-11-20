@@ -406,6 +406,43 @@ def test_a_case_whose_agent_raised_still_adds_nothing_to_the_cost():
     assert result.cost_total == pytest.approx(4e-6)
 
 
+@pytest.mark.parametrize("count", [10 ** 400, Decimal("1e400")], ids=["int", "decimal"])
+def test_a_token_count_too_large_for_a_float_scores_as_an_unknown_cost(tmp_path, count):
+    c = case([{"type": "equals", "value": "ok"}])
+    rec = record([c], lambda _v: answer_with(input_tokens=count), "a")
+    result = score([c], rec, PRICED)
+    assert (result.cases[0].passed, result.cases[0].cost_usd, result.cost_total) == (True, None, None)
+    save_recording(rec, tmp_path / "r.json")
+    prices = tmp_path / "p.toml"
+    prices.write_text('[models."m"]\ninput_per_million = 1\noutput_per_million = 1\n', encoding="utf-8")
+    cases = write_cases(tmp_path, [{"id": "c", "input": "x", "checks": [{"type": "equals", "value": "ok"}]}])
+    scored = cli("score", str(cases), str(tmp_path / "r.json"), "--prices", str(prices), cwd=tmp_path)
+    assert scored.returncode == 0, scored.stderr
+    assert "| unknown | unknown |" in scored.stdout
+
+
+def test_a_cost_too_large_for_a_float_is_unknown_never_infinite():
+    c = case([{"type": "equals", "value": "ok"}])
+    rec = record([c], lambda _v: answer_with(input_tokens=10 ** 300), "a")
+    assert score([c], rec, {"m": (1e300, 1.0)}).cases[0].cost_usd is None
+
+
+def test_a_refused_number_reads_the_agent_returned_and_a_raise_still_reads_the_agent_raised():
+    def agent(value):
+        if value == "a":
+            return answer_with(input_tokens="300")
+        if value == "b":
+            raise RuntimeError("model timed out")
+        return answer_with(latency_ms=float("nan"))
+
+    assert [c.reasons for c in score(THREE, record(THREE, agent, "x"), PRICED).cases] == [
+        ["the agent returned a refused number: input_tokens must be a whole number of zero or more, got '300'"],
+        ["the agent raised RuntimeError: model timed out"],
+        ["the agent returned a refused number: latency_ms must be a finite number of zero or more that a float can "
+         "hold, got nan"],
+    ]
+
+
 # ------------------------------------------------------------- a recording's numbers, when it loads
 
 def saved(tmp_path: Path, field: str, value) -> Path:
@@ -558,6 +595,60 @@ def test_any_other_exception_that_is_not_an_exception_still_stops_the_run(tmp_pa
         record(THREE, agent, "a")
     with pytest.raises(GeneratorExit):
         load_agent(agent_file(tmp_path, "raise GeneratorExit\n\ndef run(v):\n    return v\n"))
+
+
+def record_three(tmp_path: Path, body: str) -> subprocess.CompletedProcess:
+    cases = write_cases(tmp_path, [{"id": cid, "input": cid, "checks": [{"type": "equals", "value": "ok"}]}
+                                   for cid in ("a", "b", "c")])
+    return cli("record", str(cases), "--agent", agent_file(tmp_path, body), "--out", str(tmp_path / "r.json"),
+               cwd=tmp_path)
+
+
+@pytest.mark.parametrize("body, last_line, kept", [
+    ('def run(v):\n    if v == "b":\n        raise GeneratorExit\n    return "ok"\n', "GeneratorExit", ["a"]),
+    ("raise GeneratorExit\n\ndef run(v):\n    return v\n", "GeneratorExit", None),
+    ('class Halt(BaseException):\n    pass\n\ndef run(v):\n    if v == "b":\n        raise Halt("stop here")\n'
+     '    return "ok"\n', "Halt: stop here", ["a"]),
+], ids=["generator-exit-on-a-case", "generator-exit-as-it-loads", "its-own-base-exception"])
+def test_the_command_line_exits_2_with_the_traceback_for_any_other_exception_that_is_not_an_exception(
+        tmp_path, body, last_line, kept):
+    result = record_three(tmp_path, body)
+    assert result.returncode == 2, result.stderr  # never 1, the code kept for "the gate found a problem"
+    assert result.stderr.startswith("Traceback (most recent call last):")
+    assert result.stderr.strip().splitlines()[-1].endswith(last_line)
+    out = tmp_path / "r.json"
+    if kept is None:
+        assert not out.exists()
+    else:  # the cases answered before it are kept
+        assert list(json.loads(out.read_text(encoding="utf-8"))["cases"]) == kept
+
+
+def test_ctrl_c_from_an_agent_keeps_python_s_own_exit_through_the_command_line(tmp_path):
+    result = record_three(tmp_path, "def run(v):\n    raise KeyboardInterrupt\n")
+    assert result.returncode not in (0, 1, 2), result.returncode
+    assert result.stderr.strip().splitlines()[-1] == "KeyboardInterrupt"
+
+
+class UnprintableError(Exception):
+    def __str__(self):
+        raise RuntimeError("this error cannot be printed")
+
+
+def test_an_exception_that_cannot_be_printed_is_named_by_its_class_and_the_run_goes_on():
+    def agent(value):
+        if value == "b":
+            raise UnprintableError()
+        return "ok"
+
+    rec = record(THREE, agent, "a")
+    assert [rec["cases"][cid]["error"] for cid in ("a", "b", "c")] == [None, "UnprintableError", None]
+
+
+def test_an_agent_that_raises_an_unprintable_exception_as_it_loads_exits_2_with_its_name(tmp_path):
+    result = record_three(tmp_path, 'class Unprintable(Exception):\n    def __str__(self):\n'
+                                    '        raise RuntimeError("no")\n\nraise Unprintable()\n')
+    assert result.returncode == 2, result.stderr
+    assert result.stderr.strip().splitlines() == ["agent-eval-gate: Unprintable"]
 
 
 # ------------------------------------------------------------- the empty answers prove builds
