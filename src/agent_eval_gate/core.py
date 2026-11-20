@@ -330,10 +330,13 @@ def _latency(value: Any) -> float:
 
 def _reason(exc: BaseException) -> str:
     """The exception's name, then its message when it has one (`sys.exit()` reads "SystemExit", not "SystemExit: ").
-    A message that cannot be read (a `__str__` that raises) leaves the name alone, so the run goes on."""
+    A message that cannot be read (a `__str__` that raises, even a `GeneratorExit`) leaves the name alone, so the run
+    goes on; only Ctrl-C stops it."""
     try:
         message = str(exc)
-    except _FAILS_A_CASE:
+    except KeyboardInterrupt:
+        raise
+    except BaseException:
         message = ""
     return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
 
@@ -508,7 +511,7 @@ def score(cases: list[Case], recording: dict, prices: dict[str, tuple[float, flo
             continue
         error = entry.get("error")
         if error and entry.get("refused"):  # `record` refused a number the agent returned; the agent did not raise
-            reasons = [f"the agent returned a refused number: {error.removeprefix('ValueError: ')}"]
+            reasons = [f"the agent returned a refused number: {str(error).removeprefix('ValueError: ')}"]
         else:
             reasons = [f"the agent raised {error}"] if error else run_checks(case, entry.get("output"))
         cost = _cost(entry, prices)

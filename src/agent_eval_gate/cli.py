@@ -17,8 +17,7 @@ import traceback
 from pathlib import Path
 
 from . import __version__
-from .core import EvalError, load_agent, load_cases, load_prices, load_recording, record, save_recording, score, unpriced_models
-from .core import _reason
+from .core import EvalError, _reason, load_agent, load_cases, load_prices, load_recording, record, save_recording, score, unpriced_models
 from .gate import Limits, compare, prove
 from .report import html_page, markdown
 
