@@ -799,8 +799,9 @@ def test_the_gate_and_score_name_why_a_cost_is_unknown_and_the_gate_still_fails(
                                    for cid in ("a", "b", "c")])
     prices = str(price_table(tmp_path, price, price))
     base, cand = tmp_path / "base.json", tmp_path / "cand.json"
-    save_recording(record(THREE, lambda _v: answer_with(), "v1"), base)
-    rec = record(THREE, lambda v: answer_with(**fields) if v == "b" else answer_with(), "v2")
+    save_recording(record(THREE, lambda _v: answer_with(latency_ms=10), "v1"), base)
+    rec = record(THREE, lambda v: answer_with(**{"latency_ms": 10, **fields}) if v == "b" else answer_with(latency_ms=10),
+                 "v2")
     if edit == "drop":
         del rec["cases"]["b"]
     elif edit == "stale":
@@ -812,7 +813,8 @@ def test_the_gate_and_score_name_why_a_cost_is_unknown_and_the_gate_still_fails(
     assert "| unknown | unknown |" in scored.stdout
     assert scored.stderr.strip().splitlines() == [note]
     gated = cli("gate", str(cases), "--baseline", str(base), "--candidate", str(cand), "--prices", prices,
-                "--max-accuracy-drop", "100", "--max-newly-failing", "3", cwd=tmp_path)  # only the cost can fail it
+                "--max-accuracy-drop", "100", "--max-p95-increase", "1000", "--max-newly-failing", "3",
+                cwd=tmp_path)  # every other limit loosened: only the cost can fail it
     assert gated.returncode == 1, gated.stderr  # the gate never passes an unknown cost
     assert gated.stdout.splitlines()[0] == "gate: FAILED (v2 against v1)"
     assert f"  FAIL cost/case  unknown in the candidate: {cause}" in gated.stdout.splitlines()
@@ -823,10 +825,10 @@ FIVE = [case([{"type": "equals", "value": "ok"}], cid, cid) for cid in ("a", "b"
 
 
 def test_the_gate_names_the_causes_on_each_side_and_cuts_a_long_list_of_cases():
-    base = score(FIVE, record(FIVE, lambda _v: answer_with(model="old"), "v1"), PRICED)
-    cand = score(FIVE, record(FIVE, lambda v: answer_with(input_tokens=None, output_tokens=None) if v == "a"
-                              else answer_with(input_tokens="300"), "v2"), PRICED)
-    result = compare(base, cand, Limits(max_accuracy_drop=100, max_newly_failing=5))
+    base = score(FIVE, record(FIVE, lambda _v: answer_with(model="old", latency_ms=10), "v1"), PRICED)
+    cand = score(FIVE, record(FIVE, lambda v: answer_with(input_tokens=None, output_tokens=None, latency_ms=10)
+                              if v == "a" else answer_with(input_tokens="300"), "v2"), PRICED)
+    result = compare(base, cand, Limits(max_accuracy_drop=100, max_p95_increase=1000, max_newly_failing=5))
     assert not result.passed
     assert result.lines[1] == ("FAIL cost/case  unknown in the baseline: no price for old; in the candidate: "
                                "1 answer(s) with no token counts (a); 4 case(s) whose agent returned a refused number "
