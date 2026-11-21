@@ -14,10 +14,12 @@ from the recording as often as you like, for free.
 - **Proof that each case can fail.** A check never seen failing proves nothing. `prove` scores every
   case against empty answers and against every other case's answer, and lists the cases that pass
   anyway.
-- **Honest money.** Cost comes from a price table you keep. A model with no price, an answer with
-  no token counts, or one whose token count or latency was refused, is reported as unknown cost,
-  never as free, and the gate refuses to call an unknown cost a pass. (A recording made before
-  refused answers were marked prices them at $0: record it again.)
+- **Honest money.** Cost comes from a price table you keep, and a price that is negative, infinite
+  or NaN is refused when the table loads. A model with no price, an answer with no token counts, or
+  one whose token count or latency was refused, is reported as unknown cost, never as free, and the
+  gate refuses to call an unknown cost a pass; `score` and `gate` say what made it unknown, naming
+  the model with no price, or how many cases and the first three. (A recording made before refused
+  answers were marked prices them at $0: record it again.)
 - **Stale answers are refused.** Each answer is stored with a hash of its case's input. Change the
   input and the old answer is never scored against it: the case reads "record again".
 - **No dependencies**, Python 3.11 or newer, one self-contained HTML report, no account.
@@ -63,10 +65,10 @@ pytest
 (On Windows PowerShell, write `$X = "examples/support_triage"` first.) `gate` and `prove` exit 1
 on this example on purpose: that is what they are for. Every command exits 2, with a one-line
 reason, when it cannot run at all (a missing file, an agent that will not load, one that calls
-`sys.exit` or is canceled as it loads included, a recording that holds a refused number). An agent
-that raises any other exception that is not an `Exception` also stops a command at once, with exit
-2 and Python's own traceback; Ctrl-C stops it with Python's own exit (see
-[Your own agent](#your-own-agent)).
+`sys.exit` or is canceled as it loads included, a recording that holds a refused number, a price
+table with a price that is negative, infinite or NaN). An agent that raises any other exception
+that is not an `Exception` also stops a command at once, with exit 2 and Python's own traceback;
+Ctrl-C stops it with Python's own exit (see [Your own agent](#your-own-agent)).
 
 **The example** is a support agent that sorts a ticket (billing, bug, account, how-to), decides
 whether a person should take it, and drafts a reply, over 11 tickets. Version 2 is the change a team
