@@ -23,12 +23,12 @@ from .report import html_page, markdown
 
 
 def _scored(cases, recording_path: str, prices: dict):
-    recording = load_recording(recording_path)
-    missing = unpriced_models(recording, prices)
-    if missing:
-        print(f"note: {recording_path}: no price for {', '.join(missing)}; that cost is reported as unknown, "
-              f"never as $0", file=sys.stderr)
-    return score(cases, recording, prices)
+    result = score(cases, load_recording(recording_path), prices)
+    unknown = unpriced_models(result)  # why the cost is unknown, for the cases scored; empty when it is known
+    if unknown:
+        print(f"note: {recording_path}: {'; '.join(unknown)}; that cost is reported as unknown, never as $0",
+              file=sys.stderr)
+    return result
 
 
 def _write(path: str, text: str) -> None:
