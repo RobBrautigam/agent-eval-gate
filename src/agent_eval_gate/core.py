@@ -421,6 +421,14 @@ def load_recording(path: str | Path) -> dict:
 
 # ---------------------------------------------------------------- prices and scores
 
+def _price(value: Any) -> float:
+    """A price as a float; -0.0 is 0.0. A whole number too large for a float reads as infinite, so it is refused."""
+    try:
+        return float(value) + 0.0
+    except OverflowError:
+        return math.inf
+
+
 def load_prices(path: str | Path | None) -> dict[str, tuple[float, float]]:
     """Dollars per million input and output tokens, per model, from a TOML table you maintain. A price that is
     infinite, NaN or negative is refused here, naming the model: it would make every cost unknown, or below $0."""
@@ -433,12 +441,13 @@ def load_prices(path: str | Path | None) -> dict[str, tuple[float, float]]:
     prices: dict[str, tuple[float, float]] = {}
     for model, row in (data.get("models") or {}).items():
         try:
-            prices[model] = (float(row["input_per_million"]), float(row["output_per_million"]))
+            prices[model] = (_price(row["input_per_million"]), _price(row["output_per_million"]))
         except (KeyError, TypeError, ValueError):
             raise EvalError(f"price row {model!r} needs input_per_million and output_per_million") from None
         for column, price in zip(("input_per_million", "output_per_million"), prices[model]):
             if not math.isfinite(price) or price < 0:
-                raise EvalError(f"price row {model!r}: {_refused(column, 'a finite number of zero or more', row[column])}")
+                refused = _refused(column, "a finite number of zero or more", row[column])
+                raise EvalError(f"price row {model!r}: {refused}")
     return prices
 
 
@@ -535,6 +544,7 @@ _NO_PRICE = "no price for "
 _NO_MODEL = "token counts but no model"
 _NO_COUNTS = "no token counts"
 _REFUSED = "a refused number"
+_BAD_PRICE = "a price that is not a finite number"  # in a table given to score in code: load_prices refuses one
 _TOO_LARGE = "a token count or cost too large for a float"
 _NO_ANSWER = "no current recorded answer"
 # each cause that belongs to a case, as the note and the gate name it for a number of cases, in their order
@@ -542,6 +552,7 @@ _FOR_CASES = {
     _NO_MODEL: "answer(s) with token counts but no model",
     _NO_COUNTS: "answer(s) with no token counts",
     _REFUSED: "case(s) whose agent returned a refused number",
+    _BAD_PRICE: "case(s) whose model's price is not a finite number",
     _TOO_LARGE: "case(s) whose token count or cost is too large for a float",
     _NO_ANSWER: "case(s) with no current recorded answer",
     None: "case(s) with an unknown cost",  # a score built by hand, with no reason given
@@ -565,8 +576,13 @@ def _cost(entry: dict, prices: dict[str, tuple[float, float]]) -> tuple[float | 
     try:
         cost = (tokens_in * per_in + tokens_out * per_out) / 1_000_000
     except OverflowError:
-        return None, _TOO_LARGE  # a count too large for a float: unknown, never a stopped score
-    return (cost, None) if math.isfinite(cost) else (None, _TOO_LARGE)  # past what a float holds: never infinite
+        return None, _past_a_float(per_in, per_out)  # a count too large for a float: unknown, never a stopped score
+    return (cost, None) if math.isfinite(cost) else (None, _past_a_float(per_in, per_out))  # never infinite
+
+
+def _past_a_float(*prices: Any) -> str:
+    """Why a cost a float cannot hold is unknown: a price that is not a finite number, or else the count or cost."""
+    return _BAD_PRICE if any(p != p or p in (math.inf, -math.inf) for p in prices) else _TOO_LARGE
 
 
 def unpriced_models(scored: Score) -> list[str]:
