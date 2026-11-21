@@ -421,8 +421,17 @@ def load_recording(path: str | Path) -> dict:
 
 # ---------------------------------------------------------------- prices and scores
 
+def _price(value: Any) -> float:
+    """A price as a float; -0.0 is 0.0. A whole number too large for a float reads as infinite, so it is refused."""
+    try:
+        return float(value) + 0.0
+    except OverflowError:
+        return math.inf
+
+
 def load_prices(path: str | Path | None) -> dict[str, tuple[float, float]]:
-    """Dollars per million input and output tokens, per model, from a TOML table you maintain."""
+    """Dollars per million input and output tokens, per model, from a TOML table you maintain. A price that is
+    infinite, NaN or negative is refused here, naming the model: it would make every cost unknown, or below $0."""
     if path is None:
         return {}
     try:
@@ -432,9 +441,13 @@ def load_prices(path: str | Path | None) -> dict[str, tuple[float, float]]:
     prices: dict[str, tuple[float, float]] = {}
     for model, row in (data.get("models") or {}).items():
         try:
-            prices[model] = (float(row["input_per_million"]), float(row["output_per_million"]))
+            prices[model] = (_price(row["input_per_million"]), _price(row["output_per_million"]))
         except (KeyError, TypeError, ValueError):
             raise EvalError(f"price row {model!r} needs input_per_million and output_per_million") from None
+        for column, price in zip(("input_per_million", "output_per_million"), prices[model]):
+            if not math.isfinite(price) or price < 0:
+                refused = _refused(column, "a finite number of zero or more", row[column])
+                raise EvalError(f"price row {model!r}: {refused}")
     return prices
 
 
@@ -455,6 +468,7 @@ class CaseScore:
     cost_usd: float | None
     latency_ms: float | None   # None: no current measure (missing, or recorded for an old input)
     output: Any = None
+    cost_unknown: str | None = None   # why cost_usd is None ("no token counts", "no price for m"); None when known
 
 
 @dataclass
@@ -503,20 +517,21 @@ def score(cases: list[Case], recording: dict, prices: dict[str, tuple[float, flo
     for case in cases:
         entry = entries.get(case.id)
         if entry is None:
-            result.cases.append(CaseScore(case.id, False, ["not in the recording: record again"], None, None))
+            result.cases.append(CaseScore(case.id, False, ["not in the recording: record again"], None, None,
+                                          cost_unknown=_NO_ANSWER))
             continue
         if entry.get("input_hash") != case.input_hash:
             result.cases.append(CaseScore(case.id, False, ["the case's input changed since it was recorded: "
-                                                           "record again"], None, None))
+                                                           "record again"], None, None, cost_unknown=_NO_ANSWER))
             continue
         error = entry.get("error")
         if error and entry.get("refused"):  # `record` refused a number the agent returned; the agent did not raise
             reasons = [f"the agent returned a refused number: {str(error).removeprefix('ValueError: ')}"]
         else:
             reasons = [f"the agent raised {error}"] if error else run_checks(case, entry.get("output"))
-        cost = _cost(entry, prices)
+        cost, why = _cost(entry, prices)
         result.cases.append(CaseScore(case.id, not reasons, reasons, cost, float(entry.get("latency_ms") or 0.0),
-                                      entry.get("output")))
+                                      entry.get("output"), why))
     return result
 
 
@@ -524,31 +539,70 @@ def _reported(entry: dict) -> bool:
     return entry.get("input_tokens") is not None or entry.get("output_tokens") is not None
 
 
-def _cost(entry: dict, prices: dict[str, tuple[float, float]]) -> float | None:
+# why a case's cost is unknown (`CaseScore.cost_unknown`); a model with no price row reads "no price for <model>"
+_NO_PRICE = "no price for "
+_NO_MODEL = "token counts but no model"
+_NO_COUNTS = "no token counts"
+_REFUSED = "a refused number"
+_BAD_PRICE = "a price that is not a finite number"  # in a table given to score in code: load_prices refuses one
+_TOO_LARGE = "a token count or cost too large for a float"
+_NO_ANSWER = "no current recorded answer"
+# each cause that belongs to a case, as the note and the gate name it for a number of cases, in their order
+_FOR_CASES = {
+    _NO_MODEL: "answer(s) with token counts but no model",
+    _NO_COUNTS: "answer(s) with no token counts",
+    _REFUSED: "case(s) whose agent returned a refused number",
+    _BAD_PRICE: "case(s) whose model's price is not a finite number",
+    _TOO_LARGE: "case(s) whose token count or cost is too large for a float",
+    _NO_ANSWER: "case(s) with no current recorded answer",
+    None: "case(s) with an unknown cost",  # a score built by hand, with no reason given
+}
+
+
+def _cost(entry: dict, prices: dict[str, tuple[float, float]]) -> tuple[float | None, str | None]:
+    """The case's cost in dollars, or None with why it is unknown."""
     if entry.get("error"):
         # a refused number: the agent answered, so the call cost something nobody can know; a raise is not priced
-        return None if entry.get("refused") else 0.0
+        return (None, _REFUSED) if entry.get("refused") else (0.0, None)
     if not _reported(entry):
-        return None  # no token counts: unknown, never free
+        return None, _NO_COUNTS  # no token counts: unknown, never free
     tokens_in, tokens_out = int(entry.get("input_tokens") or 0), int(entry.get("output_tokens") or 0)
     if tokens_in + tokens_out == 0:
-        return 0.0  # the agent said zero, in so many words
+        return 0.0, None  # the agent said zero, in so many words
     model = entry.get("model")
     if model not in prices:
-        return None  # unpriced: reported as unknown, never as free
+        return None, _NO_MODEL if model is None else f"{_NO_PRICE}{model}"  # unpriced: unknown, never free
     per_in, per_out = prices[model]
     try:
         cost = (tokens_in * per_in + tokens_out * per_out) / 1_000_000
     except OverflowError:
-        return None  # a count too large for a float: unknown, never a stopped score
-    return cost if math.isfinite(cost) else None  # a cost past what a float holds: unknown, never infinite
+        return None, _past_a_float(per_in, per_out)  # a count too large for a float: unknown, never a stopped score
+    return (cost, None) if math.isfinite(cost) else (None, _past_a_float(per_in, per_out))  # never infinite
 
 
-def unpriced_models(recording: dict, prices: dict[str, tuple[float, float]]) -> list[str]:
-    """What makes a cost unknown: models with no price row, and answers with no token counts."""
-    entries = [e for e in recording["cases"].values() if not e.get("error")]
-    models = {e.get("model") for e in entries
-              if _reported(e) and int(e.get("input_tokens") or 0) + int(e.get("output_tokens") or 0) > 0}
-    found = sorted(str(m) for m in models if m not in prices)
-    silent = sum(1 for e in entries if not _reported(e))
-    return found + ([f"{silent} answer(s) with no token counts"] if silent else [])
+def _past_a_float(*prices: Any) -> str:
+    """Why a cost a float cannot hold is unknown: a price that is not a finite number, or else the count or cost."""
+    return _BAD_PRICE if any(p != p or p in (math.inf, -math.inf) for p in prices) else _TOO_LARGE
+
+
+def unpriced_models(scored: Score) -> list[str]:
+    """What makes a score's cost unknown, one phrase per cause: the models with no price row, then each kind of
+    case whose cost cannot be known, with how many and which (the first three). Empty when the cost is known."""
+    if not scored.cases:
+        return ["no cases"]
+    models: set[str] = set()
+    by_cause: dict[str | None, list[str]] = {}
+    for c in scored.cases:
+        if c.cost_usd is not None:
+            continue
+        if c.cost_unknown and c.cost_unknown.startswith(_NO_PRICE):
+            models.add(c.cost_unknown.removeprefix(_NO_PRICE))
+        else:
+            by_cause.setdefault(c.cost_unknown if c.cost_unknown in _FOR_CASES else None, []).append(c.id)
+    found = [f"{_NO_PRICE}{', '.join(sorted(models))}"] if models else []
+    for cause, phrase in _FOR_CASES.items():
+        ids = by_cause.get(cause)
+        if ids:
+            shown = ", ".join(ids[:3]) + (f" and {len(ids) - 3} more" if len(ids) > 3 else "")
+            found.append(f"{len(ids)} {phrase} ({shown})")
+    return found

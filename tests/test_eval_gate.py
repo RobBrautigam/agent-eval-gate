@@ -733,3 +733,157 @@ def test_prove_fills_a_checked_field_beneath_another_for_every_empty_value():
 def test_prove_names_only_the_fields_left_empty():
     c = not_contains("reply", "reply.text", "category")
     assert empty_decoys(c)[len(EMPTY_DECOYS)][0] == "an answer whose category, reply.text are empty text"
+
+
+# ------------------------------------------------------------- a price that is not a finite number of zero or more
+
+def price_table(tmp_path: Path, input_price: str, output_price: str = "1") -> Path:
+    path = tmp_path / "prices.toml"
+    path.write_text(f'[models."m"]\ninput_per_million = {input_price}\noutput_per_million = {output_price}\n',
+                    encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize("column, value, shown", [
+    ("input_per_million", "inf", "inf"), ("input_per_million", "nan", "nan"), ("output_per_million", "-1", "-1"),
+    ("input_per_million", "-inf", "-inf"), ("input_per_million", "1e400", "inf"),
+    ("output_per_million", '"nan"', "'nan'"), ("input_per_million", "9" * 400, "9" * 57 + "..."),
+], ids=["infinite", "nan", "negative", "negative-infinite", "too-large-for-a-float", "nan-as-text",
+        "whole-number-too-large-for-a-float"])
+def test_a_price_that_is_not_a_finite_number_of_zero_or_more_is_refused_when_the_table_loads(
+        tmp_path, column, value, shown):
+    row = {"input_per_million": "1", "output_per_million": "1", column: value}
+    with pytest.raises(EvalError) as raised:
+        load_prices(price_table(tmp_path, row["input_per_million"], row["output_per_million"]))
+    assert str(raised.value) == f"price row 'm': {column} must be a finite number of zero or more, got {shown}"
+
+
+@pytest.mark.parametrize("value, shown", [("inf", "inf"), ("nan", "nan"), ("-1", "-1"), ("9" * 400, "9" * 57 + "...")],
+                         ids=["infinite", "nan", "negative", "whole-number-too-large-for-a-float"])
+def test_score_and_gate_exit_2_naming_the_model_on_a_price_that_is_not_a_finite_number_of_zero_or_more(
+        tmp_path, value, shown):
+    cases = write_cases(tmp_path, [{"id": cid, "input": cid, "checks": [{"type": "equals", "value": "ok"}]}
+                                   for cid in ("a", "b", "c")])
+    rec = tmp_path / "r.json"
+    save_recording(record(THREE, lambda _v: answer_with(), "a"), rec)
+    prices = str(price_table(tmp_path, value))
+    for args in (["score", str(cases), str(rec), "--prices", prices],
+                 ["gate", str(cases), "--baseline", str(rec), "--candidate", str(rec), "--prices", prices]):
+        result = cli(*args, cwd=tmp_path)
+        assert result.returncode == 2, (args[0], result.stdout, result.stderr)
+        assert result.stderr.strip().splitlines() == [
+            f"agent-eval-gate: price row 'm': input_per_million must be a finite number of zero or more, got {shown}"]
+
+
+@pytest.mark.parametrize("value, loaded", [("0", 0.0), ("0.0", 0.0), ("-0.0", 0.0), ("0.25", 0.25), ("1e300", 1e300),
+                                           ('"1.5"', 1.5)],
+                         ids=["zero", "zero-point-zero", "negative-zero", "fraction", "large", "text"])
+def test_a_finite_price_of_zero_or_more_still_loads(tmp_path, value, loaded):
+    prices = load_prices(price_table(tmp_path, value, value))
+    assert prices == {"m": (loaded, loaded)}
+    assert [str(p) for p in prices["m"]] == [str(loaded)] * 2  # -0.0 loads as 0.0, never "$-0.000000" in a report
+
+
+# ------------------------------------------------------------- why a cost is unknown, in the gate and in score's note
+
+@pytest.mark.parametrize("fields, edit, price, cause", [
+    ({"model": "unpriced"}, None, "1", "no price for unpriced"),
+    ({"model": None}, None, "1", "1 answer(s) with token counts but no model (b)"),
+    ({"input_tokens": None, "output_tokens": None}, None, "1", "1 answer(s) with no token counts (b)"),
+    ({}, "drop", "1", "1 case(s) with no current recorded answer (b)"),
+    ({}, "stale", "1", "1 case(s) with no current recorded answer (b)"),
+    ({"input_tokens": "300"}, None, "1", "1 case(s) whose agent returned a refused number (b)"),
+    ({"latency_ms": float("nan")}, None, "1", "1 case(s) whose agent returned a refused number (b)"),
+    ({"input_tokens": 10 ** 400}, None, "1", "1 case(s) whose token count or cost is too large for a float (b)"),
+    ({"input_tokens": 10 ** 300}, None, "1e300", "1 case(s) whose token count or cost is too large for a float (b)"),
+], ids=["missing-price-row", "no-model", "no-token-counts", "missing-answer", "stale-answer", "refused-count",
+        "refused-latency", "overflowing-count", "overflowing-cost"])
+def test_the_gate_and_score_name_why_a_cost_is_unknown_and_the_gate_still_fails(tmp_path, fields, edit, price, cause):
+    cases = write_cases(tmp_path, [{"id": cid, "input": cid, "checks": [{"type": "equals", "value": "ok"}]}
+                                   for cid in ("a", "b", "c")])
+    prices = str(price_table(tmp_path, price, price))
+    base, cand = tmp_path / "base.json", tmp_path / "cand.json"
+    save_recording(record(THREE, lambda _v: answer_with(latency_ms=10), "v1"), base)
+    rec = record(THREE, lambda v: answer_with(**{"latency_ms": 10, **fields}) if v == "b" else answer_with(latency_ms=10),
+                 "v2")
+    if edit == "drop":
+        del rec["cases"]["b"]
+    elif edit == "stale":
+        rec["cases"]["b"]["input_hash"] = "0" * 16
+    save_recording(rec, cand)
+    note = f"note: {cand}: {cause}; that cost is reported as unknown, never as $0"
+    scored = cli("score", str(cases), str(cand), "--prices", prices, cwd=tmp_path)
+    assert scored.returncode == 0, scored.stderr
+    assert "| unknown | unknown |" in scored.stdout
+    assert scored.stderr.strip().splitlines() == [note]
+    gated = cli("gate", str(cases), "--baseline", str(base), "--candidate", str(cand), "--prices", prices,
+                "--max-accuracy-drop", "100", "--max-p95-increase", "1000", "--max-newly-failing", "3",
+                cwd=tmp_path)  # every other limit loosened: only the cost can fail it
+    assert gated.returncode == 1, gated.stderr  # the gate never passes an unknown cost
+    assert gated.stdout.splitlines()[0] == "gate: FAILED (v2 against v1)"
+    assert f"  FAIL cost/case  unknown in the candidate: {cause}" in gated.stdout.splitlines()
+    assert gated.stderr.strip().splitlines() == [note]
+
+
+FIVE = [case([{"type": "equals", "value": "ok"}], cid, cid) for cid in ("a", "b", "c", "d", "e")]
+
+
+def test_the_gate_names_the_causes_on_each_side_and_cuts_a_long_list_of_cases():
+    base = score(FIVE, record(FIVE, lambda _v: answer_with(model="old", latency_ms=10), "v1"), PRICED)
+    cand = score(FIVE, record(FIVE, lambda v: answer_with(input_tokens=None, output_tokens=None, latency_ms=10)
+                              if v == "a" else answer_with(input_tokens="300"), "v2"), PRICED)
+    result = compare(base, cand, Limits(max_accuracy_drop=100, max_p95_increase=1000, max_newly_failing=5))
+    assert not result.passed
+    assert result.lines[1] == ("FAIL cost/case  unknown in the baseline: no price for old; in the candidate: "
+                               "1 answer(s) with no token counts (a); 4 case(s) whose agent returned a refused number "
+                               "(b, c, d and 1 more)")
+
+
+def test_the_gate_names_an_unknown_cost_it_cannot_explain_and_a_score_with_no_cases():
+    from agent_eval_gate.core import CaseScore, Score
+
+    by_hand = Score("v2", [CaseScore("x", True, [], None, 10.0)])  # a score built without a reason for its cost
+    result = compare(Score("v1"), by_hand, Limits())
+    assert not result.passed
+    assert result.lines[1] == ("FAIL cost/case  unknown in the baseline: no cases; in the candidate: "
+                               "1 case(s) with an unknown cost (x)")
+
+
+def test_score_prints_no_note_when_every_cost_is_known(tmp_path):
+    cases, prices = str(EXAMPLE / "cases.jsonl"), str(EXAMPLE / "prices.toml")
+    assert cli("record", cases, "--agent", f"{EXAMPLE / 'agent_v1.py'}:run", "--out", str(tmp_path / "v1.json"),
+               cwd=tmp_path).returncode == 0
+    scored = cli("score", cases, str(tmp_path / "v1.json"), "--prices", prices, cwd=tmp_path)
+    assert (scored.returncode, scored.stderr) == (0, "")
+    unpriced = cli("score", cases, str(tmp_path / "v1.json"), cwd=tmp_path)
+    assert unpriced.stderr.strip().splitlines() == [
+        f"note: {tmp_path / 'v1.json'}: no price for example-small; that cost is reported as unknown, never as $0"]
+
+
+@pytest.mark.parametrize("price, fields", [
+    ((float("nan"), 1.0), {}), ((float("inf"), 1.0), {}), ((float("inf"), 1.0), {"input_tokens": 0}),
+    ((1.0, float("-inf")), {}), ((float("nan"), 1.0), {"input_tokens": 10 ** 400}),
+], ids=["nan", "infinite", "infinite-times-zero", "negative-infinite", "nan-and-a-count-too-large-for-a-float"])
+def test_a_price_that_is_not_a_finite_number_given_to_score_in_code_is_named_as_the_cause(price, fields):
+    base = score(THREE, record(THREE, lambda _v: answer_with(latency_ms=10), "v1"), PRICED)
+    cand = score(THREE, record(THREE, lambda _v: answer_with(latency_ms=10, **fields), "v2"), {"m": price})
+    assert [c.cost_usd for c in cand.cases] == [None, None, None]  # load_prices refuses such a price; score never did
+    result = compare(base, cand, Limits(max_accuracy_drop=100, max_p95_increase=1000, max_newly_failing=3))
+    assert not result.passed
+    assert result.lines[1] == ("FAIL cost/case  unknown in the candidate: 3 case(s) whose model's price is not a "
+                               "finite number (a, b, c)")
+
+
+def test_an_entry_for_an_id_the_case_file_lacks_is_never_read_for_the_note(tmp_path):
+    cases = write_cases(tmp_path, [{"id": cid, "input": cid, "checks": [{"type": "equals", "value": "ok"}]}
+                                   for cid in ("a", "b", "c")])
+    prices = str(price_table(tmp_path, "1"))
+    rec = record(THREE, lambda _v: answer_with(latency_ms=10), "v1")
+    rec["cases"]["zz"] = {**rec["cases"]["a"], "model": ["m"]}  # edited by hand: for no case, a model that is a list
+    path = tmp_path / "r.json"
+    save_recording(rec, path)
+    scored = cli("score", str(cases), str(path), "--prices", prices, cwd=tmp_path)
+    assert (scored.returncode, scored.stderr) == (0, "")
+    gated = cli("gate", str(cases), "--baseline", str(path), "--candidate", str(path), "--prices", prices, cwd=tmp_path)
+    assert (gated.returncode, gated.stderr) == (0, ""), gated.stdout
+    assert gated.stdout.splitlines()[0] == "gate: passed (v1 against v1)"

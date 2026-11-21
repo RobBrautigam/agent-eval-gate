@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from .core import Case, Score, run_checks
+from .core import Case, Score, run_checks, unpriced_models
 
 
 @dataclass
@@ -42,8 +42,10 @@ def compare(baseline: Score, candidate: Score, limits: Limits) -> GateResult:
     before, after = baseline.cost_per_case, candidate.cost_per_case
     if before is None or after is None:
         ok = False
-        lines.append("FAIL cost/case  unknown: a model has no row in the price table, or a case has no "
-                     "current recorded answer")
+        why = [f"in the {side}: {'; '.join(unpriced_models(scored))}"
+               for side, scored, cost in (("baseline", baseline, before), ("candidate", candidate, after))
+               if cost is None]
+        lines.append(f"FAIL cost/case  unknown {'; '.join(why)}")
     else:
         change = _pct_change(before, after)
         cost_ok = change <= limits.max_cost_increase + 1e-9
