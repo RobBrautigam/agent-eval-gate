@@ -747,8 +747,9 @@ def price_table(tmp_path: Path, input_price: str, output_price: str = "1") -> Pa
 @pytest.mark.parametrize("column, value, shown", [
     ("input_per_million", "inf", "inf"), ("input_per_million", "nan", "nan"), ("output_per_million", "-1", "-1"),
     ("input_per_million", "-inf", "-inf"), ("input_per_million", "1e400", "inf"),
-    ("output_per_million", '"nan"', "'nan'"),
-], ids=["infinite", "nan", "negative", "negative-infinite", "too-large-for-a-float", "nan-as-text"])
+    ("output_per_million", '"nan"', "'nan'"), ("input_per_million", "9" * 400, "9" * 57 + "..."),
+], ids=["infinite", "nan", "negative", "negative-infinite", "too-large-for-a-float", "nan-as-text",
+        "whole-number-too-large-for-a-float"])
 def test_a_price_that_is_not_a_finite_number_of_zero_or_more_is_refused_when_the_table_loads(
         tmp_path, column, value, shown):
     row = {"input_per_million": "1", "output_per_million": "1", column: value}
@@ -757,9 +758,10 @@ def test_a_price_that_is_not_a_finite_number_of_zero_or_more_is_refused_when_the
     assert str(raised.value) == f"price row 'm': {column} must be a finite number of zero or more, got {shown}"
 
 
-@pytest.mark.parametrize("value", ["inf", "nan", "-1"], ids=["infinite", "nan", "negative"])
+@pytest.mark.parametrize("value, shown", [("inf", "inf"), ("nan", "nan"), ("-1", "-1"), ("9" * 400, "9" * 57 + "...")],
+                         ids=["infinite", "nan", "negative", "whole-number-too-large-for-a-float"])
 def test_score_and_gate_exit_2_naming_the_model_on_a_price_that_is_not_a_finite_number_of_zero_or_more(
-        tmp_path, value):
+        tmp_path, value, shown):
     cases = write_cases(tmp_path, [{"id": cid, "input": cid, "checks": [{"type": "equals", "value": "ok"}]}
                                    for cid in ("a", "b", "c")])
     rec = tmp_path / "r.json"
@@ -770,14 +772,16 @@ def test_score_and_gate_exit_2_naming_the_model_on_a_price_that_is_not_a_finite_
         result = cli(*args, cwd=tmp_path)
         assert result.returncode == 2, (args[0], result.stdout, result.stderr)
         assert result.stderr.strip().splitlines() == [
-            f"agent-eval-gate: price row 'm': input_per_million must be a finite number of zero or more, got {value}"]
+            f"agent-eval-gate: price row 'm': input_per_million must be a finite number of zero or more, got {shown}"]
 
 
 @pytest.mark.parametrize("value, loaded", [("0", 0.0), ("0.0", 0.0), ("-0.0", 0.0), ("0.25", 0.25), ("1e300", 1e300),
                                            ('"1.5"', 1.5)],
                          ids=["zero", "zero-point-zero", "negative-zero", "fraction", "large", "text"])
 def test_a_finite_price_of_zero_or_more_still_loads(tmp_path, value, loaded):
-    assert load_prices(price_table(tmp_path, value, value)) == {"m": (loaded, loaded)}
+    prices = load_prices(price_table(tmp_path, value, value))
+    assert prices == {"m": (loaded, loaded)}
+    assert [str(p) for p in prices["m"]] == [str(loaded)] * 2  # -0.0 loads as 0.0, never "$-0.000000" in a report
 
 
 # ------------------------------------------------------------- why a cost is unknown, in the gate and in score's note
@@ -854,3 +858,32 @@ def test_score_prints_no_note_when_every_cost_is_known(tmp_path):
     unpriced = cli("score", cases, str(tmp_path / "v1.json"), cwd=tmp_path)
     assert unpriced.stderr.strip().splitlines() == [
         f"note: {tmp_path / 'v1.json'}: no price for example-small; that cost is reported as unknown, never as $0"]
+
+
+@pytest.mark.parametrize("price, fields", [
+    ((float("nan"), 1.0), {}), ((float("inf"), 1.0), {}), ((float("inf"), 1.0), {"input_tokens": 0}),
+    ((1.0, float("-inf")), {}), ((float("nan"), 1.0), {"input_tokens": 10 ** 400}),
+], ids=["nan", "infinite", "infinite-times-zero", "negative-infinite", "nan-and-a-count-too-large-for-a-float"])
+def test_a_price_that_is_not_a_finite_number_given_to_score_in_code_is_named_as_the_cause(price, fields):
+    base = score(THREE, record(THREE, lambda _v: answer_with(latency_ms=10), "v1"), PRICED)
+    cand = score(THREE, record(THREE, lambda _v: answer_with(latency_ms=10, **fields), "v2"), {"m": price})
+    assert [c.cost_usd for c in cand.cases] == [None, None, None]  # load_prices refuses such a price; score never did
+    result = compare(base, cand, Limits(max_accuracy_drop=100, max_p95_increase=1000, max_newly_failing=3))
+    assert not result.passed
+    assert result.lines[1] == ("FAIL cost/case  unknown in the candidate: 3 case(s) whose model's price is not a "
+                               "finite number (a, b, c)")
+
+
+def test_an_entry_for_an_id_the_case_file_lacks_is_never_read_for_the_note(tmp_path):
+    cases = write_cases(tmp_path, [{"id": cid, "input": cid, "checks": [{"type": "equals", "value": "ok"}]}
+                                   for cid in ("a", "b", "c")])
+    prices = str(price_table(tmp_path, "1"))
+    rec = record(THREE, lambda _v: answer_with(latency_ms=10), "v1")
+    rec["cases"]["zz"] = {**rec["cases"]["a"], "model": ["m"]}  # edited by hand: for no case, a model that is a list
+    path = tmp_path / "r.json"
+    save_recording(rec, path)
+    scored = cli("score", str(cases), str(path), "--prices", prices, cwd=tmp_path)
+    assert (scored.returncode, scored.stderr) == (0, "")
+    gated = cli("gate", str(cases), "--baseline", str(path), "--candidate", str(path), "--prices", prices, cwd=tmp_path)
+    assert (gated.returncode, gated.stderr) == (0, ""), gated.stdout
+    assert gated.stdout.splitlines()[0] == "gate: passed (v1 against v1)"
